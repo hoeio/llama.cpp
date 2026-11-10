@@ -496,6 +496,8 @@ struct ggml_threadpool {
     struct ggml_cgraph * cgraph;
     struct ggml_cplan  * cplan;
 
+    bool mmid_own; // Vollie: this graph holds the global MUL_MAT_ID chunk counters
+
     // synchronization primitives
     atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
     atomic_int GGML_CACHE_ALIGN n_barrier;
@@ -2072,6 +2074,9 @@ static _Thread_local int     ggml_cpu_mmid_seq_tl = 0; // MUL_MAT_ID ops run so 
 // thread 0 can reset the next op's bank before the barrier while slow threads finish the
 // current op (a thread is never more than one MUL_MAT_ID behind thread 0).
 static struct { atomic_int v; char pad[60]; } ggml_cpu_mmid_ctr[2][GGML_CPU_MMID_MAX_AS];
+// the counters are global, so only one graph at a time (the owner threadpool) may use them; others take the stock path
+static atomic_flag ggml_cpu_mmid_busy = ATOMIC_FLAG_INIT;
+static _Thread_local bool ggml_cpu_mmid_own_tl = false;
 
 // Vollie: env GGML_EXPERT_ANON=<N> (0 / unset = off, nothing allocated; N <= 64): the N most used
 // experts of every expert tensor (gate, up, down of each layer) are copied into anonymous memory,
@@ -2531,7 +2536,7 @@ static bool ggml_cpu_mmid_fast_ok(const struct ggml_tensor * dst, int nth, size_
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids  = dst->src[2];
     const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
-    return (ggml_cpu_mmid & 1) && (nth > 1 || ggml_cpu_mmid_test1) &&
+    return (ggml_cpu_mmid & 1) && ggml_cpu_mmid_own_tl && (nth > 1 || ggml_cpu_mmid_test1) &&
            ids->ne[1] == 1 && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
            src0->ne[2] <= GGML_CPU_MMID_MAX_AS && src0->ne[2]*ids->ne[0] <= GGML_CPU_SKIP_MAX &&
            src1->type == GGML_TYPE_F32 && src1->type != vec_dot_type && ggml_is_contiguous(src1) &&
@@ -4571,8 +4576,9 @@ static void ggml_cpu_budget_print(void) {
 // touches that cache tensor, or anything other than the CPY reads the scan's state part.
 // ponytail: at most 64 layers per graph; more layers fall back to the stock CPY
 static int ggml_cpu_ssm_inplace = 0;
-static struct ggml_tensor * ggml_cpu_ssm_scan[64], * ggml_cpu_ssm_cpy[64];
-static int ggml_cpu_ssm_n = 0;
+// per calling thread: contexts may compute graphs at the same time
+static _Thread_local struct ggml_tensor * ggml_cpu_ssm_scan[64], * ggml_cpu_ssm_cpy[64];
+static _Thread_local int ggml_cpu_ssm_n = 0;
 
 static inline const struct ggml_tensor * ggml_cpu_base(const struct ggml_tensor * t) {
     return t->view_src ? t->view_src : t;
@@ -4662,8 +4668,8 @@ static void ggml_cpu_ssm_undo(void) {
 // Applied per graph and undone after it, like GGML_SSM_INPLACE.
 // ponytail: at most 64 layers per graph; more layers fall back to the stock ops
 static int ggml_cpu_conv_ring = 0;
-static struct ggml_tensor * ggml_cpu_conv_op[64], * ggml_cpu_conv_cat[64], * ggml_cpu_conv_cpy[64];
-static int ggml_cpu_conv_n = 0;
+static _Thread_local struct ggml_tensor * ggml_cpu_conv_op[64], * ggml_cpu_conv_cat[64], * ggml_cpu_conv_cpy[64];
+static _Thread_local int ggml_cpu_conv_n = 0;
 
 static bool ggml_cpu_overlaps(const struct ggml_tensor * a, const struct ggml_tensor * b) {
     const char * pa = a->data, * pb = b->data;
@@ -5391,6 +5397,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
     }
     ggml_cpu_mmid_seq_tl = 0;
+    ggml_cpu_mmid_own_tl = tp->mmid_own;
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -6008,6 +6015,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    threadpool->mmid_own = !atomic_flag_test_and_set(&ggml_cpu_mmid_busy);
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -6049,6 +6058,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     clear_numa_thread_affinity();
     ggml_cpu_ssm_undo();
     ggml_cpu_conv_undo();
+    if (threadpool->mmid_own) {
+        threadpool->mmid_own = false;
+        atomic_flag_clear(&ggml_cpu_mmid_busy);
+    }
 #if !defined(_WIN32)
     ggml_cpu_pred_drain();
 #endif
