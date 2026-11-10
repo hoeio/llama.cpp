@@ -2954,10 +2954,41 @@ static void llama_sampler_penalties_accept(struct llama_sampler * smpl, llama_to
 #endif
 }
 
+static void llama_sampler_penalties_apply_one(const llama_sampler_penalties * ctx, llama_token_data & cur, int count) {
+    assert(count > 0 && count <= ctx->penalty_last_n);
+
+    // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
+    // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
+    if (cur.logit <= 0) {
+        cur.logit *= ctx->penalty_repeat;
+    } else {
+        cur.logit /= ctx->penalty_repeat;
+    }
+
+    cur.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+}
+
 static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (llama_sampler_penalties *) smpl->ctx;
 
     if (ctx->is_disabled()) {
+        return;
+    }
+
+    // fast path: if each penalized token t sits at index t (as llama_sampler_sample fills cur_p), only visit those
+    bool by_id = true;
+    for (const auto & [token, count] : ctx->token_count) {
+        if (token < 0 || (size_t) token >= cur_p->size || cur_p->data[token].id != token) {
+            by_id = false;
+            break;
+        }
+    }
+
+    if (by_id) {
+        for (const auto & [token, count] : ctx->token_count) {
+            llama_sampler_penalties_apply_one(ctx, cur_p->data[token], count);
+        }
+        cur_p->sorted = false;
         return;
     }
 
@@ -2968,19 +2999,7 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
             continue;
         }
 
-        const int count = token_iter->second;
-
-        assert(count > 0 && count <= ctx->penalty_last_n);
-
-        // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
-        // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
-        } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
-        }
-
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        llama_sampler_penalties_apply_one(ctx, cur_p->data[i], token_iter->second);
     }
 
     cur_p->sorted = false;

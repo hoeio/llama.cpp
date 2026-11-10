@@ -188,6 +188,36 @@ static void test_penalties(
     tester.check();
 }
 
+// the result must not depend on the order of cur_p (in id order takes the fast path, reversed does not)
+static void test_penalties_order(const std::vector<llama_token> & last_tokens, float repeat_penalty, float alpha_frequency, float alpha_presence) {
+    const int n_vocab = 8;
+
+    std::vector<llama_token_data> fwd;
+    std::vector<llama_token_data> rev;
+    for (llama_token id = 0; id < n_vocab; id++) {
+        fwd.push_back({ id, (float) id - 3.5f, 0.0f });
+    }
+    rev.assign(fwd.rbegin(), fwd.rend());
+
+    for (auto * cur : { &fwd, &rev }) {
+        auto * sampler = llama_sampler_init_penalties(n_vocab, (int32_t) last_tokens.size(), repeat_penalty, alpha_frequency, alpha_presence);
+        for (llama_token t : last_tokens) {
+            llama_sampler_accept(sampler, t);
+        }
+        llama_token_data_array cur_p = { cur->data(), cur->size(), -1, true };
+        llama_sampler_apply(sampler, &cur_p);
+        GGML_ASSERT(!cur_p.sorted);
+        llama_sampler_free(sampler);
+    }
+
+    for (int i = 0; i < n_vocab; i++) {
+        const llama_token_data & a = fwd[i];
+        const llama_token_data & b = rev[n_vocab - 1 - i];
+        GGML_ASSERT(a.id == b.id);
+        GGML_ASSERT(a.logit == b.logit);
+    }
+}
+
 static void test_dry(
     const std::vector<float> & probs, const std::vector<llama_token> & last_tokens,
     const std::vector<float> & expected_probs, float dry_multiplier, float dry_base,
@@ -385,6 +415,10 @@ int main(void) {
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2},       {0.000023f, 0.000023f, 0.000023f, 0.499966f, 0.499966f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, {0.000000f, 0.000023f, 0.000023f, 0.499977f, 0.499977f}, 1.0f, 5.0f, 5.0f);
 
+
+    test_penalties_order({0, 1, 2, 0, 7, 7, 7}, 1.5f, 0.0f, 0.0f);
+    test_penalties_order({0, 1, 2, 0, 7, 7, 7}, 1.0f, 0.3f, 0.7f);
+    test_penalties_order({3, 4, 3},             1.2f, 0.5f, 0.5f);
 
     test_dry({0.25f, 0.25f, 0.25f, 0.25f}, {0, 1}, {0.25f, 0.25f, 0.25f, 0.25f}, 1.0f, 1.1f, 2, 4, {});
     test_dry({0.25f, 0.25f, 0.25f, 0.25f}, {0, 1, 2, 0, 1}, {0.296923f, 0.296923f, 0.109232f, 0.296923f}, 1.0f, 1.1f, 2, 5, {});
