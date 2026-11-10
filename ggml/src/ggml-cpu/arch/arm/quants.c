@@ -2239,7 +2239,7 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         ggml_uint8x16x4_t q3h;
 
-        int32_t isum = 0;
+        int32x4_t visum = vzero;
 
         // Set up scales
         memcpy(aux, x[i].scales, 12);
@@ -2250,6 +2250,14 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         int8_t * scale = (int8_t *)utmp;
         for (int j = 0; j < 16; ++j) scale[j] -= m32;
+
+        const int8x16_t vs8   = vld1q_s8(scale);
+        const int16x8_t vs16l = vmovl_s8(vget_low_s8(vs8));
+        const int16x8_t vs16h = vmovl_s8(vget_high_s8(vs8));
+        const int32x4_t vsc[4] = {
+            vmovl_s16(vget_low_s16(vs16l)), vmovl_s16(vget_high_s16(vs16l)),
+            vmovl_s16(vget_low_s16(vs16h)), vmovl_s16(vget_high_s16(vs16h)),
+        };
 
         for (int j = 0; j < QK_K/128; ++j) {
 
@@ -2267,12 +2275,13 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
             q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 2), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
             q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 2), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
 
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_1.val[0])) * scale[0];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_1.val[1])) * scale[1];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_1.val[2])) * scale[2];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_1.val[3])) * scale[3];
-
-            scale += 4;
+            {
+                const int32x4_t p0 = ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_1.val[0]);
+                const int32x4_t p1 = ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_1.val[1]);
+                const int32x4_t p2 = ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_1.val[2]);
+                const int32x4_t p3 = ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_1.val[3]);
+                visum = vmlaq_s32(visum, vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3)), vsc[2*j + 0]);
+            }
 
             q3h.val[0] = vbicq_u8(m2, qhbits.val[0]);
             q3h.val[1] = vbicq_u8(m2, qhbits.val[1]);
@@ -2284,12 +2293,13 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
             q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 6), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
             q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 6), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
 
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_2.val[0])) * scale[0];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_2.val[1])) * scale[1];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_2.val[2])) * scale[2];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_2.val[3])) * scale[3];
-
-            scale += 4;
+            {
+                const int32x4_t p0 = ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_2.val[0]);
+                const int32x4_t p1 = ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_2.val[1]);
+                const int32x4_t p2 = ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_2.val[2]);
+                const int32x4_t p3 = ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_2.val[3]);
+                visum = vmlaq_s32(visum, vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3)), vsc[2*j + 1]);
+            }
 
             if (j == 0) {
                 qhbits.val[0] = vshrq_n_u8(qhbits.val[0], 4);
@@ -2297,7 +2307,7 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
             }
 
         }
-        sum += d * isum;
+        sum += d * vaddvq_s32(visum);
 
     }
 
