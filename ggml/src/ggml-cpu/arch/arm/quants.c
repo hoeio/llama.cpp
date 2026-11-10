@@ -14,6 +14,13 @@
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
+#include <time.h>   // Vollie: GGML_CPU_BENCH
+#if !defined(_WIN32)
+#include <sys/mman.h> // Vollie: GGML_CPU_BENCH cold arena (r13)
+#endif
+#if defined(__linux__)
+#include <sched.h>    // Vollie: GGML_CPU_BENCH core checks (r13b)
+#endif
 
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
@@ -2018,6 +2025,10 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+// Vollie: 1 = vectorized sub-block sums in the NEON Q3_K dot below (bit-identical), 0 = upstream loop.
+// Set per graph by ggml-cpu.c (env GGML_Q3K_VEC, or alternated by GGML_CPU_AB=q3k).
+int ggml_cpu_q3k_vec = 1;
+
 void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -2239,7 +2250,10 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         ggml_uint8x16x4_t q3h;
 
-        int32_t isum = 0;
+        // Vollie: per-sub-block sums stay in vectors, 4 at a time, times 4 scales
+        // (was 16 serial horizontal adds + scalar mul-adds per block). Integer math,
+        // so the block sum is identical.
+        int32x4_t visum = vzero;
 
         // Set up scales
         memcpy(aux, x[i].scales, 12);
@@ -2250,54 +2264,115 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         int8_t * scale = (int8_t *)utmp;
         for (int j = 0; j < 16; ++j) scale[j] -= m32;
+        const int8x16_t  vs8  = vld1q_s8(scale);
+        const int16x8_t  vs16l = vmovl_s8(vget_low_s8(vs8));
+        const int16x8_t  vs16h = vmovl_s8(vget_high_s8(vs8));
+        const int32x4_t  vsc[4] = {
+            vmovl_s16(vget_low_s16(vs16l)), vmovl_s16(vget_high_s16(vs16l)),
+            vmovl_s16(vget_low_s16(vs16h)), vmovl_s16(vget_high_s16(vs16h)),
+        };
+        int si = 0;
 
-        for (int j = 0; j < QK_K/128; ++j) {
+        if (ggml_cpu_q3k_vec) {
+            for (int j = 0; j < QK_K/128; ++j) {
 
-            const ggml_uint8x16x2_t q3bits = ggml_vld1q_u8_x2(q3); q3 += 32;
-            const ggml_int8x16x4_t q8bytes_1 = ggml_vld1q_s8_x4(q8); q8 += 64;
-            const ggml_int8x16x4_t q8bytes_2 = ggml_vld1q_s8_x4(q8); q8 += 64;
+                const ggml_uint8x16x2_t q3bits = ggml_vld1q_u8_x2(q3); q3 += 32;
+                const ggml_int8x16x4_t q8bytes_1 = ggml_vld1q_s8_x4(q8); q8 += 64;
+                const ggml_int8x16x4_t q8bytes_2 = ggml_vld1q_s8_x4(q8); q8 += 64;
 
-            q3h.val[0] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[0]), 2);
-            q3h.val[1] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[1]), 2);
-            q3h.val[2] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[0]), 1);
-            q3h.val[3] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[1]), 1);
+                q3h.val[0] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[0]), 2);
+                q3h.val[1] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[1]), 2);
+                q3h.val[2] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[0]), 1);
+                q3h.val[3] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[1]), 1);
 
-            q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[0], m3b)), vreinterpretq_s8_u8(q3h.val[0]));
-            q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[1], m3b)), vreinterpretq_s8_u8(q3h.val[1]));
-            q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 2), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
-            q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 2), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
+                q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[0], m3b)), vreinterpretq_s8_u8(q3h.val[0]));
+                q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[1], m3b)), vreinterpretq_s8_u8(q3h.val[1]));
+                q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 2), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
+                q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 2), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
 
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_1.val[0])) * scale[0];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_1.val[1])) * scale[1];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_1.val[2])) * scale[2];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_1.val[3])) * scale[3];
+                {
+                    const int32x4_t p0 = ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_1.val[0]);
+                    const int32x4_t p1 = ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_1.val[1]);
+                    const int32x4_t p2 = ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_1.val[2]);
+                    const int32x4_t p3 = ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_1.val[3]);
+                    visum = vmlaq_s32(visum, vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3)), vsc[si++]);
+                }
 
-            scale += 4;
+                q3h.val[0] = vbicq_u8(m2, qhbits.val[0]);
+                q3h.val[1] = vbicq_u8(m2, qhbits.val[1]);
+                q3h.val[2] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[0]), 1);
+                q3h.val[3] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[1]), 1);
 
-            q3h.val[0] = vbicq_u8(m2, qhbits.val[0]);
-            q3h.val[1] = vbicq_u8(m2, qhbits.val[1]);
-            q3h.val[2] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[0]), 1);
-            q3h.val[3] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[1]), 1);
+                q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 4), m3b)), vreinterpretq_s8_u8(q3h.val[0]));
+                q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 4), m3b)), vreinterpretq_s8_u8(q3h.val[1]));
+                q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 6), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
+                q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 6), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
 
-            q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 4), m3b)), vreinterpretq_s8_u8(q3h.val[0]));
-            q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 4), m3b)), vreinterpretq_s8_u8(q3h.val[1]));
-            q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 6), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
-            q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 6), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
+                {
+                    const int32x4_t p0 = ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_2.val[0]);
+                    const int32x4_t p1 = ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_2.val[1]);
+                    const int32x4_t p2 = ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_2.val[2]);
+                    const int32x4_t p3 = ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_2.val[3]);
+                    visum = vmlaq_s32(visum, vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3)), vsc[si++]);
+                }
 
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_2.val[0])) * scale[0];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_2.val[1])) * scale[1];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_2.val[2])) * scale[2];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_2.val[3])) * scale[3];
+                if (j == 0) {
+                    qhbits.val[0] = vshrq_n_u8(qhbits.val[0], 4);
+                    qhbits.val[1] = vshrq_n_u8(qhbits.val[1], 4);
+                }
 
-            scale += 4;
-
-            if (j == 0) {
-                qhbits.val[0] = vshrq_n_u8(qhbits.val[0], 4);
-                qhbits.val[1] = vshrq_n_u8(qhbits.val[1], 4);
             }
+            sum += d * vaddvq_s32(visum);
+        } else {
+            int32_t isum = 0;
+            for (int j = 0; j < QK_K/128; ++j) {
 
+                const ggml_uint8x16x2_t q3bits = ggml_vld1q_u8_x2(q3); q3 += 32;
+                const ggml_int8x16x4_t q8bytes_1 = ggml_vld1q_s8_x4(q8); q8 += 64;
+                const ggml_int8x16x4_t q8bytes_2 = ggml_vld1q_s8_x4(q8); q8 += 64;
+
+                q3h.val[0] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[0]), 2);
+                q3h.val[1] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[1]), 2);
+                q3h.val[2] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[0]), 1);
+                q3h.val[3] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[1]), 1);
+
+                q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[0], m3b)), vreinterpretq_s8_u8(q3h.val[0]));
+                q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[1], m3b)), vreinterpretq_s8_u8(q3h.val[1]));
+                q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 2), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
+                q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 2), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
+
+                isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_1.val[0])) * scale[0];
+                isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_1.val[1])) * scale[1];
+                isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_1.val[2])) * scale[2];
+                isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_1.val[3])) * scale[3];
+
+                scale += 4;
+
+                q3h.val[0] = vbicq_u8(m2, qhbits.val[0]);
+                q3h.val[1] = vbicq_u8(m2, qhbits.val[1]);
+                q3h.val[2] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[0]), 1);
+                q3h.val[3] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[1]), 1);
+
+                q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 4), m3b)), vreinterpretq_s8_u8(q3h.val[0]));
+                q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 4), m3b)), vreinterpretq_s8_u8(q3h.val[1]));
+                q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 6), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
+                q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 6), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
+
+                isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_2.val[0])) * scale[0];
+                isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_2.val[1])) * scale[1];
+                isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_2.val[2])) * scale[2];
+                isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_2.val[3])) * scale[3];
+
+                scale += 4;
+
+                if (j == 0) {
+                    qhbits.val[0] = vshrq_n_u8(qhbits.val[0], 4);
+                    qhbits.val[1] = vshrq_n_u8(qhbits.val[1], 4);
+                }
+
+            }
+            sum += d * isum;
         }
-        sum += d * isum;
 
     }
 
@@ -2312,6 +2387,2277 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     ggml_vec_dot_q3_K_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 
+}
+
+#if defined(__ARM_NEON)
+// One 128-weight half-block of one Q3_K row against the two 64-byte activation groups
+// (q8a = first 64 bytes, q8b = next 64), accumulating into visum with the same per-16
+// scales as the vectorized branch of ggml_vec_dot_q3_K_q8_K above (vsc[si], vsc[si + 1]).
+static inline int32x4_t ggml_q3k_half(const uint8_t * GGML_RESTRICT q3, ggml_uint8x16x2_t qhbits,
+        ggml_int8x16x4_t q8a, ggml_int8x16x4_t q8b, const int32x4_t * vsc, int si, int32x4_t visum) {
+    const uint8x16_t m3b = vdupq_n_u8(0x3);
+    const int32x4_t  vzero = vdupq_n_s32(0);
+    const uint8x16_t m0 = vdupq_n_u8(1);
+    const uint8x16_t m1 = vshlq_n_u8(m0, 1);
+    const uint8x16_t m2 = vshlq_n_u8(m0, 2);
+    const uint8x16_t m3 = vshlq_n_u8(m0, 3);
+
+    const ggml_uint8x16x2_t q3bits = ggml_vld1q_u8_x2(q3);
+    ggml_uint8x16x4_t q3h;
+    ggml_int8x16x4_t  q3bytes;
+
+    q3h.val[0] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[0]), 2);
+    q3h.val[1] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[1]), 2);
+    q3h.val[2] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[0]), 1);
+    q3h.val[3] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[1]), 1);
+
+    q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[0], m3b)), vreinterpretq_s8_u8(q3h.val[0]));
+    q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[1], m3b)), vreinterpretq_s8_u8(q3h.val[1]));
+    q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 2), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
+    q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 2), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
+    {
+        const int32x4_t p0 = ggml_vdotq_s32(vzero, q3bytes.val[0], q8a.val[0]);
+        const int32x4_t p1 = ggml_vdotq_s32(vzero, q3bytes.val[1], q8a.val[1]);
+        const int32x4_t p2 = ggml_vdotq_s32(vzero, q3bytes.val[2], q8a.val[2]);
+        const int32x4_t p3 = ggml_vdotq_s32(vzero, q3bytes.val[3], q8a.val[3]);
+        visum = vmlaq_s32(visum, vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3)), vsc[si]);
+    }
+
+    q3h.val[0] = vbicq_u8(m2, qhbits.val[0]);
+    q3h.val[1] = vbicq_u8(m2, qhbits.val[1]);
+    q3h.val[2] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[0]), 1);
+    q3h.val[3] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[1]), 1);
+
+    q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 4), m3b)), vreinterpretq_s8_u8(q3h.val[0]));
+    q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 4), m3b)), vreinterpretq_s8_u8(q3h.val[1]));
+    q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 6), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
+    q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 6), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
+    {
+        const int32x4_t p0 = ggml_vdotq_s32(vzero, q3bytes.val[0], q8b.val[0]);
+        const int32x4_t p1 = ggml_vdotq_s32(vzero, q3bytes.val[1], q8b.val[1]);
+        const int32x4_t p2 = ggml_vdotq_s32(vzero, q3bytes.val[2], q8b.val[2]);
+        const int32x4_t p3 = ggml_vdotq_s32(vzero, q3bytes.val[3], q8b.val[3]);
+        visum = vmlaq_s32(visum, vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3)), vsc[si + 1]);
+    }
+    return visum;
+}
+
+// Vollie: GGML_Q3K_ILP=1 pieces. One block's 16 6-bit scales, unpacked with vector shifts
+// (same bytes as the scalar utmp code, minus 32), and lane group k (0..3) widened to int32.
+static inline int8x16_t ggml_q3k_scales_vec(const uint8_t * GGML_RESTRICT sc) {
+    uint32_t aux[3];
+    memcpy(aux, sc, 12);
+    const uint32x2_t a01 = vld1_u32(aux);
+    const uint32x4_t lo  = vcombine_u32(a01, a01);    // aux0 aux1 aux0 aux1
+    const uint32x4_t hi  = vdupq_n_u32(aux[2]);
+    const int32x4_t  shl = { 0, 0, -4, -4 };          // right shifts of lo, per utmp word
+    const int32x4_t  shh = { 0, -2, -4, -6 };         // right shifts of aux2
+    const uint32x4_t u = vorrq_u32(vandq_u32(vshlq_u32(lo, shl), vdupq_n_u32(0x0f0f0f0f)),
+                                   vshlq_n_u32(vandq_u32(vshlq_u32(hi, shh), vdupq_n_u32(0x03030303)), 4));
+    return vsubq_s8(vreinterpretq_s8_u32(u), vdupq_n_s8(32));
+}
+
+static inline int32x4_t ggml_q3k_sc(int8x16_t s, int k) {
+    const int16x8_t h = k < 2 ? vmovl_s8(vget_low_s8(s)) : vmovl_s8(vget_high_s8(s));
+    return k & 1 ? vmovl_s16(vget_high_s16(h)) : vmovl_s16(vget_low_s16(h));
+}
+
+// ggml_q3k_half with its two 64-weight groups in independent accumulators (no visum chain).
+// Integer sums, so the block sum is the same in any order.
+static inline int32x4_t ggml_q3k_half_ilp(const uint8_t * GGML_RESTRICT q3, ggml_uint8x16x2_t qhbits,
+        ggml_int8x16x4_t q8a, ggml_int8x16x4_t q8b, int8x16_t vs8, int si) {
+    const uint8x16_t m3b = vdupq_n_u8(0x3);
+    const int32x4_t  vzero = vdupq_n_s32(0);
+    const uint8x16_t m0 = vdupq_n_u8(1);
+    const uint8x16_t m1 = vshlq_n_u8(m0, 1);
+    const uint8x16_t m2 = vshlq_n_u8(m0, 2);
+    const uint8x16_t m3 = vshlq_n_u8(m0, 3);
+    const ggml_uint8x16x2_t q3bits = ggml_vld1q_u8_x2(q3);
+
+    const int8x16_t a0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[0], m3b)),
+                                  vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m0, qhbits.val[0]), 2)));
+    const int8x16_t a1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[1], m3b)),
+                                  vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m0, qhbits.val[1]), 2)));
+    const int8x16_t a2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 2), m3b)),
+                                  vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m1, qhbits.val[0]), 1)));
+    const int8x16_t a3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 2), m3b)),
+                                  vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m1, qhbits.val[1]), 1)));
+    const int8x16_t b0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 4), m3b)),
+                                  vreinterpretq_s8_u8(vbicq_u8(m2, qhbits.val[0])));
+    const int8x16_t b1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 4), m3b)),
+                                  vreinterpretq_s8_u8(vbicq_u8(m2, qhbits.val[1])));
+    const int8x16_t b2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 6), m3b)),
+                                  vreinterpretq_s8_u8(vshrq_n_u8(vbicq_u8(m3, qhbits.val[0]), 1)));
+    const int8x16_t b3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 6), m3b)),
+                                  vreinterpretq_s8_u8(vshrq_n_u8(vbicq_u8(m3, qhbits.val[1]), 1)));
+
+    const int32x4_t pa = vpaddq_s32(vpaddq_s32(ggml_vdotq_s32(vzero, a0, q8a.val[0]), ggml_vdotq_s32(vzero, a1, q8a.val[1])),
+                                    vpaddq_s32(ggml_vdotq_s32(vzero, a2, q8a.val[2]), ggml_vdotq_s32(vzero, a3, q8a.val[3])));
+    const int32x4_t pb = vpaddq_s32(vpaddq_s32(ggml_vdotq_s32(vzero, b0, q8b.val[0]), ggml_vdotq_s32(vzero, b1, q8b.val[1])),
+                                    vpaddq_s32(ggml_vdotq_s32(vzero, b2, q8b.val[2]), ggml_vdotq_s32(vzero, b3, q8b.val[3])));
+    return vaddq_s32(vmulq_s32(pa, ggml_q3k_sc(vs8, si)), vmulq_s32(pb, ggml_q3k_sc(vs8, si + 1)));
+}
+#endif
+
+// Vollie: env GGML_Q3K_ILP (default on since r4; GGML_Q3K_ILP=0 turns it off): the x4 dot below with the 4 rows' block sums
+// computed side by side and no serial accumulator chain (bit-identical: integer block sums,
+// same float step per block and row). GGML_Q3K_PF=1 (default off): prfm pldl1keep of the next
+// 4 rows' block i while rows 0-3 work on block i (advice only). Both set per graph by ggml-cpu.c.
+int ggml_cpu_q3k_ilp = 1, ggml_cpu_q3k_pf = 0;
+
+#if defined(__ARM_NEON)
+static inline void ggml_q3k_prefetch4(const block_q3_K * GGML_RESTRICT const x[4], int i, size_t bx) {
+    for (int r = 0; r < 4; ++r) {
+        const char * p = (const char *) &x[r][i] + 4*bx; // row r + 4, block i
+        __builtin_prefetch(p, 0, 3);
+        __builtin_prefetch(p + 64, 0, 3);
+        __builtin_prefetch(p + sizeof(block_q3_K) - 1, 0, 3);
+    }
+}
+
+static void ggml_vec_dot_q3_K_q8_K_x4_ilp(int nb, float * GGML_RESTRICT s, const block_q3_K * GGML_RESTRICT const x[4],
+                                          size_t bx, const block_q8_K * GGML_RESTRICT y) {
+    float sum[4] = { 0, 0, 0, 0 };
+    const bool pf = ggml_cpu_q3k_pf != 0;
+    for (int i = 0; i < nb; ++i) {
+        if (pf) {
+            ggml_q3k_prefetch4(x, i, bx);
+        }
+        const int8_t * GGML_RESTRICT q8 = y[i].qs;
+        const ggml_int8x16x4_t q8a_1 = ggml_vld1q_s8_x4(q8);
+        const ggml_int8x16x4_t q8b_1 = ggml_vld1q_s8_x4(q8 + 64);
+        const ggml_int8x16x4_t q8a_2 = ggml_vld1q_s8_x4(q8 + 128);
+        const ggml_int8x16x4_t q8b_2 = ggml_vld1q_s8_x4(q8 + 192);
+        int8x16_t vs8[4];
+        ggml_uint8x16x2_t qh[4];
+        int32x4_t acc[4];
+        for (int r = 0; r < 4; ++r) {
+            vs8[r] = ggml_q3k_scales_vec(x[r][i].scales);
+            qh[r]  = ggml_vld1q_u8_x2(x[r][i].hmask);
+        }
+        for (int r = 0; r < 4; ++r) {
+            acc[r] = ggml_q3k_half_ilp(x[r][i].qs, qh[r], q8a_1, q8b_1, vs8[r], 0);
+        }
+        for (int r = 0; r < 4; ++r) {
+            qh[r].val[0] = vshrq_n_u8(qh[r].val[0], 4);
+            qh[r].val[1] = vshrq_n_u8(qh[r].val[1], 4);
+            acc[r] = vaddq_s32(acc[r], ggml_q3k_half_ilp(x[r][i].qs + 32, qh[r], q8a_2, q8b_2, vs8[r], 2));
+        }
+        for (int r = 0; r < 4; ++r) {
+            const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[r][i].d);
+            sum[r] += d * vaddvq_s32(acc[r]);
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        s[r] = sum[r];
+    }
+}
+#endif
+
+// Vollie: env GGML_Q3K_KERN (default 1 since r11, 0 = the r9 ILP path; r10, reports/05_compute_less.md §9.9 (i); bit-identical): the x4 dot
+// below as an in-register 4-row kernel. Per Q3_K block the 4 rows' qs/hmask are word-transposed (lane = row),
+// each 16-weight group is 4 by-element sdots into an accumulator seeded at -(4 << p) * bsum[g] (value byte =
+// (q2 + 4h) << p, p = 0/2/4/0 for planes 0-3, built in place: shift+and the hmask bit, bit/sri the qs plane),
+// and its int32 scale is pre-shifted by 4 - p, so one accumulator holds 16 x the integer block sum (exact,
+// |sum| < 2^27); the float step is the stock one (d = y.d * fp16(x.d), sum = fma(d, isum, sum), as the x4 code
+// compiles on both clangs). Hand-scheduled asm (lab/logs/r34/gen_kern.py): no movi, no spills, 377 NEON ops
+// per 4-row block on the NDK build vs 562 for the ILP path. Set per graph by ggml-cpu.c.
+int ggml_cpu_q3k_kern = 0;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#pragma GCC diagnostic ignored "-Woverlength-strings" // Vollie: the asm bodies below are one string each
+// registers: v0-3 hmask (lane = row), v4-7 qs, v8-11 int32 scales of the 4 groups, v12-15 the 4 rows' 6-bit scales
+// (utmp words), v16 isum, v17 activation, v18 group sum, v19-21 temps, v22 d per row, v23 sum per row, v24-31 constants
+static void ggml_vec_dot_q3_K_q8_K_x4_kern(int nb, float * GGML_RESTRICT s, const block_q3_K * GGML_RESTRICT const x[4],
+                                           const block_q8_K * GGML_RESTRICT y) {
+    static const uint8_t ix[32] = { 0, 4, 8, 12, 2, 6, 10, 14, 16, 20, 24, 28, 18, 22, 26, 30,   // scale bytes [k][row], c = 0
+                                    1, 5, 9, 13, 3, 7, 11, 15, 17, 21, 25, 29, 19, 23, 27, 31 }; // c = 1
+    const block_q3_K * x0 = x[0], * x1 = x[1], * x2 = x[2], * x3 = x[3];
+    static_assert(sizeof(block_q3_K) == 110 && sizeof(block_q8_K) == 292, "Q3_K / Q8_K layout");
+    __asm__ volatile(
+        "movi v23.4s, #0\n"
+        "movi v24.16b, #32\n" "movi v25.16b, #0x0f\n" "movi v26.16b, #0x03\n" "movi v27.16b, #0x0c\n"
+        "movi v28.16b, #0x30\n" "movi v29.16b, #0x04\n" "movi v30.16b, #0x10\n" "movi v31.16b, #0x40\n"
+        "1:\n"
+        "ldur q0, [%[x0], #94]\n"
+        "ldur q1, [%[x1], #94]\n"
+        "ldur q2, [%[x2], #94]\n"
+        "ldur q3, [%[x3], #94]\n"
+        "ext v0.16b, v0.16b, v0.16b, #2\n"
+        "ext v1.16b, v1.16b, v1.16b, #2\n"
+        "ext v2.16b, v2.16b, v2.16b, #2\n"
+        "ext v3.16b, v3.16b, v3.16b, #2\n"
+        "trn1 v4.4s, v0.4s, v1.4s\n"
+        "trn2 v5.4s, v0.4s, v1.4s\n"
+        "trn1 v6.4s, v2.4s, v3.4s\n"
+        "trn2 v7.4s, v2.4s, v3.4s\n"
+        "trn1 v0.2d, v4.2d, v6.2d\n"
+        "trn1 v1.2d, v5.2d, v7.2d\n"
+        "trn2 v2.2d, v4.2d, v6.2d\n"
+        "trn2 v3.2d, v5.2d, v7.2d\n"
+        "ldr s17, [%[y]]\n"
+        "xtn v3.4h, v3.4s\n"
+        "fcvtl v22.4s, v3.4h\n"
+        "fmul v22.4s, v22.4s, v17.s[0]\n"
+        "and v12.16b, v0.16b, v25.16b\n"
+        "shl v4.16b, v2.16b, #4\n"
+        "bit v12.16b, v4.16b, v28.16b\n"
+        "and v13.16b, v1.16b, v25.16b\n"
+        "shl v5.16b, v2.16b, #2\n"
+        "bit v13.16b, v5.16b, v28.16b\n"
+        "ushr v14.16b, v0.16b, #4\n"
+        "bit v14.16b, v2.16b, v28.16b\n"
+        "ushr v15.16b, v1.16b, #4\n"
+        "ushr v6.16b, v2.16b, #2\n"
+        "bit v15.16b, v6.16b, v28.16b\n"
+        "ldr q4, [%[x0], #0]\n"
+        "ldr q5, [%[x1], #0]\n"
+        "ldr q6, [%[x2], #0]\n"
+        "ldr q7, [%[x3], #0]\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "trn1 v0.2d, v8.2d, v10.2d\n"
+        "trn1 v1.2d, v9.2d, v11.2d\n"
+        "trn2 v2.2d, v8.2d, v10.2d\n"
+        "trn2 v3.2d, v9.2d, v11.2d\n"
+        "ldr q4, [%[x0], #32]\n"
+        "ldr q5, [%[x1], #32]\n"
+        "ldr q6, [%[x2], #32]\n"
+        "ldr q7, [%[x3], #32]\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "trn1 v4.2d, v8.2d, v10.2d\n"
+        "trn1 v5.2d, v9.2d, v11.2d\n"
+        "trn2 v6.2d, v8.2d, v10.2d\n"
+        "trn2 v7.2d, v9.2d, v11.2d\n"
+        "ldr q19, [%[ix], #0]\n"
+        "tbl v8.16b, { v12.16b, v13.16b }, v19.16b\n"
+        "ssubl v9.8h, v8.8b, v24.8b\n"
+        "ssubl2 v10.8h, v8.16b, v24.16b\n"
+        "sshll v8.4s, v9.4h, #4\n"
+        "sshll2 v9.4s, v9.8h, #2\n"
+        "sshll2 v11.4s, v10.8h, #4\n"
+        "sshll v10.4s, v10.4h, #0\n"
+        "ldr q17, [%[y], #4]\n"
+        "ldrsh w9, [%[y], #260]\n"
+        "neg w9, w9, lsl #2\n"
+        "dup v18.4s, w9\n"
+        "shl v19.16b, v0.16b, #2\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "bit v19.16b, v4.16b, v26.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "shl v20.16b, v1.16b, #2\n"
+        "and v20.16b, v20.16b, v29.16b\n"
+        "bit v20.16b, v5.16b, v26.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "shl v21.16b, v2.16b, #2\n"
+        "and v21.16b, v21.16b, v29.16b\n"
+        "bit v21.16b, v6.16b, v26.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "shl v19.16b, v3.16b, #2\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "bit v19.16b, v7.16b, v26.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mul v16.4s, v18.4s, v8.4s\n"
+        "ldr q17, [%[y], #36]\n"
+        "ldrsh w9, [%[y], #264]\n"
+        "neg w9, w9, lsl #4\n"
+        "dup v18.4s, w9\n"
+        "shl v19.16b, v0.16b, #3\n"
+        "and v19.16b, v19.16b, v30.16b\n"
+        "bit v19.16b, v4.16b, v27.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "shl v20.16b, v1.16b, #3\n"
+        "and v20.16b, v20.16b, v30.16b\n"
+        "bit v20.16b, v5.16b, v27.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "shl v21.16b, v2.16b, #3\n"
+        "and v21.16b, v21.16b, v30.16b\n"
+        "bit v21.16b, v6.16b, v27.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "shl v19.16b, v3.16b, #3\n"
+        "and v19.16b, v19.16b, v30.16b\n"
+        "bit v19.16b, v7.16b, v27.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v9.4s\n"
+        "ldr q17, [%[y], #68]\n"
+        "ldrsh w9, [%[y], #268]\n"
+        "neg w9, w9, lsl #6\n"
+        "dup v18.4s, w9\n"
+        "shl v19.16b, v0.16b, #4\n"
+        "and v19.16b, v19.16b, v31.16b\n"
+        "bit v19.16b, v4.16b, v28.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "shl v20.16b, v1.16b, #4\n"
+        "and v20.16b, v20.16b, v31.16b\n"
+        "bit v20.16b, v5.16b, v28.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "shl v21.16b, v2.16b, #4\n"
+        "and v21.16b, v21.16b, v31.16b\n"
+        "bit v21.16b, v6.16b, v28.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "shl v19.16b, v3.16b, #4\n"
+        "and v19.16b, v19.16b, v31.16b\n"
+        "bit v19.16b, v7.16b, v28.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v10.4s\n"
+        "ldr q17, [%[y], #100]\n"
+        "ldrsh w9, [%[y], #272]\n"
+        "neg w9, w9, lsl #2\n"
+        "dup v18.4s, w9\n"
+        "ushr v19.16b, v0.16b, #1\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "sri v19.16b, v4.16b, #6\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "ushr v20.16b, v1.16b, #1\n"
+        "and v20.16b, v20.16b, v29.16b\n"
+        "sri v20.16b, v5.16b, #6\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ushr v21.16b, v2.16b, #1\n"
+        "and v21.16b, v21.16b, v29.16b\n"
+        "sri v21.16b, v6.16b, #6\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ushr v19.16b, v3.16b, #1\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "sri v19.16b, v7.16b, #6\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v11.4s\n"
+        "ldr q4, [%[x0], #64]\n"
+        "ldr q5, [%[x1], #64]\n"
+        "ldr q6, [%[x2], #64]\n"
+        "ldr q7, [%[x3], #64]\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "trn1 v4.2d, v8.2d, v10.2d\n"
+        "trn1 v5.2d, v9.2d, v11.2d\n"
+        "trn2 v6.2d, v8.2d, v10.2d\n"
+        "trn2 v7.2d, v9.2d, v11.2d\n"
+        "ldr q19, [%[ix], #0]\n"
+        "tbl v8.16b, { v14.16b, v15.16b }, v19.16b\n"
+        "ssubl v9.8h, v8.8b, v24.8b\n"
+        "ssubl2 v10.8h, v8.16b, v24.16b\n"
+        "sshll v8.4s, v9.4h, #4\n"
+        "sshll2 v9.4s, v9.8h, #2\n"
+        "sshll2 v11.4s, v10.8h, #4\n"
+        "sshll v10.4s, v10.4h, #0\n"
+        "ldr q17, [%[y], #132]\n"
+        "ldrsh w9, [%[y], #276]\n"
+        "neg w9, w9, lsl #2\n"
+        "dup v18.4s, w9\n"
+        "ushr v19.16b, v0.16b, #2\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "bit v19.16b, v4.16b, v26.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "ushr v20.16b, v1.16b, #2\n"
+        "and v20.16b, v20.16b, v29.16b\n"
+        "bit v20.16b, v5.16b, v26.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ushr v21.16b, v2.16b, #2\n"
+        "and v21.16b, v21.16b, v29.16b\n"
+        "bit v21.16b, v6.16b, v26.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ushr v19.16b, v3.16b, #2\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "bit v19.16b, v7.16b, v26.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v8.4s\n"
+        "ldr q17, [%[y], #164]\n"
+        "ldrsh w9, [%[y], #280]\n"
+        "neg w9, w9, lsl #4\n"
+        "dup v18.4s, w9\n"
+        "ushr v19.16b, v0.16b, #1\n"
+        "and v19.16b, v19.16b, v30.16b\n"
+        "bit v19.16b, v4.16b, v27.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "ushr v20.16b, v1.16b, #1\n"
+        "and v20.16b, v20.16b, v30.16b\n"
+        "bit v20.16b, v5.16b, v27.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ushr v21.16b, v2.16b, #1\n"
+        "and v21.16b, v21.16b, v30.16b\n"
+        "bit v21.16b, v6.16b, v27.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ushr v19.16b, v3.16b, #1\n"
+        "and v19.16b, v19.16b, v30.16b\n"
+        "bit v19.16b, v7.16b, v27.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v9.4s\n"
+        "ldr q17, [%[y], #196]\n"
+        "ldrsh w9, [%[y], #284]\n"
+        "neg w9, w9, lsl #6\n"
+        "dup v18.4s, w9\n"
+        "and v19.16b, v0.16b, v31.16b\n"
+        "bit v19.16b, v4.16b, v28.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "and v20.16b, v1.16b, v31.16b\n"
+        "bit v20.16b, v5.16b, v28.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and v21.16b, v2.16b, v31.16b\n"
+        "bit v21.16b, v6.16b, v28.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "and v19.16b, v3.16b, v31.16b\n"
+        "bit v19.16b, v7.16b, v28.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v10.4s\n"
+        "ldr q17, [%[y], #228]\n"
+        "ldrsh w9, [%[y], #288]\n"
+        "neg w9, w9, lsl #2\n"
+        "dup v18.4s, w9\n"
+        "ushr v19.16b, v0.16b, #5\n"
+        "sri v19.16b, v4.16b, #6\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "ushr v20.16b, v1.16b, #5\n"
+        "sri v20.16b, v5.16b, #6\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ushr v21.16b, v2.16b, #5\n"
+        "sri v21.16b, v6.16b, #6\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ushr v19.16b, v3.16b, #5\n"
+        "sri v19.16b, v7.16b, #6\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v11.4s\n"
+        "ldr q4, [%[x0], #16]\n"
+        "ldr q5, [%[x1], #16]\n"
+        "ldr q6, [%[x2], #16]\n"
+        "ldr q7, [%[x3], #16]\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "trn1 v0.2d, v8.2d, v10.2d\n"
+        "trn1 v1.2d, v9.2d, v11.2d\n"
+        "trn2 v2.2d, v8.2d, v10.2d\n"
+        "trn2 v3.2d, v9.2d, v11.2d\n"
+        "ldr q4, [%[x0], #48]\n"
+        "ldr q5, [%[x1], #48]\n"
+        "ldr q6, [%[x2], #48]\n"
+        "ldr q7, [%[x3], #48]\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "trn1 v4.2d, v8.2d, v10.2d\n"
+        "trn1 v5.2d, v9.2d, v11.2d\n"
+        "trn2 v6.2d, v8.2d, v10.2d\n"
+        "trn2 v7.2d, v9.2d, v11.2d\n"
+        "ldr q19, [%[ix], #16]\n"
+        "tbl v8.16b, { v12.16b, v13.16b }, v19.16b\n"
+        "ssubl v9.8h, v8.8b, v24.8b\n"
+        "ssubl2 v10.8h, v8.16b, v24.16b\n"
+        "sshll v8.4s, v9.4h, #4\n"
+        "sshll2 v9.4s, v9.8h, #2\n"
+        "sshll2 v11.4s, v10.8h, #4\n"
+        "sshll v10.4s, v10.4h, #0\n"
+        "ldr q17, [%[y], #20]\n"
+        "ldrsh w9, [%[y], #262]\n"
+        "neg w9, w9, lsl #2\n"
+        "dup v18.4s, w9\n"
+        "shl v19.16b, v0.16b, #2\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "bit v19.16b, v4.16b, v26.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "shl v20.16b, v1.16b, #2\n"
+        "and v20.16b, v20.16b, v29.16b\n"
+        "bit v20.16b, v5.16b, v26.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "shl v21.16b, v2.16b, #2\n"
+        "and v21.16b, v21.16b, v29.16b\n"
+        "bit v21.16b, v6.16b, v26.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "shl v19.16b, v3.16b, #2\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "bit v19.16b, v7.16b, v26.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v8.4s\n"
+        "ldr q17, [%[y], #52]\n"
+        "ldrsh w9, [%[y], #266]\n"
+        "neg w9, w9, lsl #4\n"
+        "dup v18.4s, w9\n"
+        "shl v19.16b, v0.16b, #3\n"
+        "and v19.16b, v19.16b, v30.16b\n"
+        "bit v19.16b, v4.16b, v27.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "shl v20.16b, v1.16b, #3\n"
+        "and v20.16b, v20.16b, v30.16b\n"
+        "bit v20.16b, v5.16b, v27.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "shl v21.16b, v2.16b, #3\n"
+        "and v21.16b, v21.16b, v30.16b\n"
+        "bit v21.16b, v6.16b, v27.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "shl v19.16b, v3.16b, #3\n"
+        "and v19.16b, v19.16b, v30.16b\n"
+        "bit v19.16b, v7.16b, v27.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v9.4s\n"
+        "ldr q17, [%[y], #84]\n"
+        "ldrsh w9, [%[y], #270]\n"
+        "neg w9, w9, lsl #6\n"
+        "dup v18.4s, w9\n"
+        "shl v19.16b, v0.16b, #4\n"
+        "and v19.16b, v19.16b, v31.16b\n"
+        "bit v19.16b, v4.16b, v28.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "shl v20.16b, v1.16b, #4\n"
+        "and v20.16b, v20.16b, v31.16b\n"
+        "bit v20.16b, v5.16b, v28.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "shl v21.16b, v2.16b, #4\n"
+        "and v21.16b, v21.16b, v31.16b\n"
+        "bit v21.16b, v6.16b, v28.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "shl v19.16b, v3.16b, #4\n"
+        "and v19.16b, v19.16b, v31.16b\n"
+        "bit v19.16b, v7.16b, v28.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v10.4s\n"
+        "ldr q17, [%[y], #116]\n"
+        "ldrsh w9, [%[y], #274]\n"
+        "neg w9, w9, lsl #2\n"
+        "dup v18.4s, w9\n"
+        "ushr v19.16b, v0.16b, #1\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "sri v19.16b, v4.16b, #6\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "ushr v20.16b, v1.16b, #1\n"
+        "and v20.16b, v20.16b, v29.16b\n"
+        "sri v20.16b, v5.16b, #6\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ushr v21.16b, v2.16b, #1\n"
+        "and v21.16b, v21.16b, v29.16b\n"
+        "sri v21.16b, v6.16b, #6\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ushr v19.16b, v3.16b, #1\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "sri v19.16b, v7.16b, #6\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v11.4s\n"
+        "ldr q4, [%[x0], #80]\n"
+        "ldr q5, [%[x1], #80]\n"
+        "ldr q6, [%[x2], #80]\n"
+        "ldr q7, [%[x3], #80]\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "trn1 v4.2d, v8.2d, v10.2d\n"
+        "trn1 v5.2d, v9.2d, v11.2d\n"
+        "trn2 v6.2d, v8.2d, v10.2d\n"
+        "trn2 v7.2d, v9.2d, v11.2d\n"
+        "ldr q19, [%[ix], #16]\n"
+        "tbl v8.16b, { v14.16b, v15.16b }, v19.16b\n"
+        "ssubl v9.8h, v8.8b, v24.8b\n"
+        "ssubl2 v10.8h, v8.16b, v24.16b\n"
+        "sshll v8.4s, v9.4h, #4\n"
+        "sshll2 v9.4s, v9.8h, #2\n"
+        "sshll2 v11.4s, v10.8h, #4\n"
+        "sshll v10.4s, v10.4h, #0\n"
+        "ldr q17, [%[y], #148]\n"
+        "ldrsh w9, [%[y], #278]\n"
+        "neg w9, w9, lsl #2\n"
+        "dup v18.4s, w9\n"
+        "ushr v19.16b, v0.16b, #2\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "bit v19.16b, v4.16b, v26.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "ushr v20.16b, v1.16b, #2\n"
+        "and v20.16b, v20.16b, v29.16b\n"
+        "bit v20.16b, v5.16b, v26.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ushr v21.16b, v2.16b, #2\n"
+        "and v21.16b, v21.16b, v29.16b\n"
+        "bit v21.16b, v6.16b, v26.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ushr v19.16b, v3.16b, #2\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "bit v19.16b, v7.16b, v26.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v8.4s\n"
+        "ldr q17, [%[y], #180]\n"
+        "ldrsh w9, [%[y], #282]\n"
+        "neg w9, w9, lsl #4\n"
+        "dup v18.4s, w9\n"
+        "ushr v19.16b, v0.16b, #1\n"
+        "and v19.16b, v19.16b, v30.16b\n"
+        "bit v19.16b, v4.16b, v27.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "ushr v20.16b, v1.16b, #1\n"
+        "and v20.16b, v20.16b, v30.16b\n"
+        "bit v20.16b, v5.16b, v27.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ushr v21.16b, v2.16b, #1\n"
+        "and v21.16b, v21.16b, v30.16b\n"
+        "bit v21.16b, v6.16b, v27.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ushr v19.16b, v3.16b, #1\n"
+        "and v19.16b, v19.16b, v30.16b\n"
+        "bit v19.16b, v7.16b, v27.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v9.4s\n"
+        "ldr q17, [%[y], #212]\n"
+        "ldrsh w9, [%[y], #286]\n"
+        "neg w9, w9, lsl #6\n"
+        "dup v18.4s, w9\n"
+        "and v19.16b, v0.16b, v31.16b\n"
+        "bit v19.16b, v4.16b, v28.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "and v20.16b, v1.16b, v31.16b\n"
+        "bit v20.16b, v5.16b, v28.16b\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and v21.16b, v2.16b, v31.16b\n"
+        "bit v21.16b, v6.16b, v28.16b\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "and v19.16b, v3.16b, v31.16b\n"
+        "bit v19.16b, v7.16b, v28.16b\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v10.4s\n"
+        "ldr q17, [%[y], #244]\n"
+        "ldrsh w9, [%[y], #290]\n"
+        "neg w9, w9, lsl #2\n"
+        "dup v18.4s, w9\n"
+        "ushr v19.16b, v0.16b, #5\n"
+        "sri v19.16b, v4.16b, #6\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "ushr v20.16b, v1.16b, #5\n"
+        "sri v20.16b, v5.16b, #6\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ushr v21.16b, v2.16b, #5\n"
+        "sri v21.16b, v6.16b, #6\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ushr v19.16b, v3.16b, #5\n"
+        "sri v19.16b, v7.16b, #6\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "mla v16.4s, v18.4s, v11.4s\n"
+        "sshr v16.4s, v16.4s, #4\n"
+        "scvtf v16.4s, v16.4s\n"
+        "fmla v23.4s, v16.4s, v22.4s\n"
+        "add %[x0], %[x0], #110\n"
+        "add %[x1], %[x1], #110\n"
+        "add %[x2], %[x2], #110\n"
+        "add %[x3], %[x3], #110\n"
+        "add %[y], %[y], #292\n"
+        "subs %w[nb], %w[nb], #1\n"
+        "b.ne 1b\n"
+        "str q23, [%[s]]\n"
+        : [x0] "+r"(x0), [x1] "+r"(x1), [x2] "+r"(x2), [x3] "+r"(x3), [y] "+r"(y), [nb] "+r"(nb)
+        : [s] "r"(s), [ix] "r"(ix)
+        : "x9", "memory", "cc", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+          "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+}
+#endif
+
+// Vollie: four Q3_K rows (stride bx) against one Q8_K row. The activation is loaded once per
+// block and shared by the four rows; each row's integer block sum and float accumulation are
+// the same as ggml_vec_dot_q3_K_q8_K's vectorized branch, so s[r] is bit-identical to it.
+void ggml_vec_dot_q3_K_q8_K_x4(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy) {
+    assert(n % QK_K == 0);
+#if defined(__ARM_NEON)
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    const int nb = n / QK_K;
+    const block_q3_K * GGML_RESTRICT x[4] = {
+        (const block_q3_K *) vx,
+        (const block_q3_K *) ((const char *) vx + bx),
+        (const block_q3_K *) ((const char *) vx + 2*bx),
+        (const block_q3_K *) ((const char *) vx + 3*bx),
+    };
+    const block_q8_K * GGML_RESTRICT y = vy;
+#if defined(__ARM_FEATURE_DOTPROD)
+    if (ggml_cpu_q3k_kern) {
+        ggml_vec_dot_q3_K_q8_K_x4_kern(nb, s, x, y);
+        return;
+    }
+#endif
+    if (ggml_cpu_q3k_ilp) {
+        ggml_vec_dot_q3_K_q8_K_x4_ilp(nb, s, x, bx, y);
+        return;
+    }
+    const bool pf = ggml_cpu_q3k_pf != 0;
+    float sum[4] = { 0, 0, 0, 0 };
+
+    for (int i = 0; i < nb; ++i) {
+        if (pf) {
+            ggml_q3k_prefetch4(x, i, bx);
+        }
+        const int8_t * GGML_RESTRICT q8 = y[i].qs;
+        const ggml_int8x16x4_t q8a_1 = ggml_vld1q_s8_x4(q8);
+        const ggml_int8x16x4_t q8b_1 = ggml_vld1q_s8_x4(q8 + 64);
+        const ggml_int8x16x4_t q8a_2 = ggml_vld1q_s8_x4(q8 + 128);
+        const ggml_int8x16x4_t q8b_2 = ggml_vld1q_s8_x4(q8 + 192);
+
+        for (int r = 0; r < 4; ++r) {
+            const block_q3_K * GGML_RESTRICT xr = &x[r][i];
+            const float d = y[i].d * GGML_CPU_FP16_TO_FP32(xr->d);
+
+            uint32_t aux[3];
+            uint32_t utmp[4];
+            memcpy(aux, xr->scales, 12);
+            utmp[3] = ((aux[1] >> 4) & kmask2) | (((aux[2] >> 6) & kmask1) << 4);
+            utmp[2] = ((aux[0] >> 4) & kmask2) | (((aux[2] >> 4) & kmask1) << 4);
+            utmp[1] = (aux[1] & kmask2) | (((aux[2] >> 2) & kmask1) << 4);
+            utmp[0] = (aux[0] & kmask2) | (((aux[2] >> 0) & kmask1) << 4);
+            int8_t * scale = (int8_t *) utmp;
+            for (int j = 0; j < 16; ++j) scale[j] -= 32;
+            const int8x16_t  vs8   = vld1q_s8(scale);
+            const int16x8_t  vs16l = vmovl_s8(vget_low_s8(vs8));
+            const int16x8_t  vs16h = vmovl_s8(vget_high_s8(vs8));
+            const int32x4_t  vsc[4] = {
+                vmovl_s16(vget_low_s16(vs16l)), vmovl_s16(vget_high_s16(vs16l)),
+                vmovl_s16(vget_low_s16(vs16h)), vmovl_s16(vget_high_s16(vs16h)),
+            };
+
+            ggml_uint8x16x2_t qhbits = ggml_vld1q_u8_x2(xr->hmask);
+            int32x4_t visum = vdupq_n_s32(0);
+            visum = ggml_q3k_half(xr->qs, qhbits, q8a_1, q8b_1, vsc, 0, visum);
+            qhbits.val[0] = vshrq_n_u8(qhbits.val[0], 4);
+            qhbits.val[1] = vshrq_n_u8(qhbits.val[1], 4);
+            visum = ggml_q3k_half(xr->qs + 32, qhbits, q8a_2, q8b_2, vsc, 2, visum);
+            sum[r] += d * vaddvq_s32(visum);
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        s[r] = sum[r];
+    }
+#else
+    for (int r = 0; r < 4; ++r) {
+        ggml_vec_dot_q3_K_q8_K(n, s + r, 0, (const char *) vx + r*bx, 0, vy, 0, 1);
+    }
+#endif
+}
+
+// ---- Vollie: env GGML_CPU_BENCH (r10, reports/05_compute_less.md §9.9 (iii)): a 1-thread, cache-hot kernel timing of the
+// Q3_K expert dot, printed once as "cpu-bench q3k ..." lines by ggml-cpu.c. Cost measurements, not levers; nothing here
+// is on the model path. Synthetic expert slices (random Q3_K rows, sane d) of the served shapes.
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+// The scalar-assisted prototype: the integer units build planes 0 and 1 of the next block (64-bit SWAR on two rows'
+// words; the same bytes as the NEON unpack) into a 512-byte L1 buffer while NEON runs this block from the other one.
+// ponytail: bench only — the last block's look-ahead reads up to 202 bytes past row 3's end (the bench pads its rows).
+static void ggml_q3k_bench_scalar(int nb, float * GGML_RESTRICT s, const block_q3_K * GGML_RESTRICT const x[4],
+                                  const block_q8_K * GGML_RESTRICT y) {
+    static const uint8_t ix[32] = { 0, 4, 8, 12, 2, 6, 10, 14, 16, 20, 24, 28, 18, 22, 26, 30,
+                                    1, 5, 9, 13, 3, 7, 11, 15, 17, 21, 25, 29, 19, 23, 27, 31 };
+    static _Thread_local uint8_t buf[2][512] __attribute__((aligned(64)));
+    uint8_t * bc = buf[0], * bn = buf[1];
+    const block_q3_K * x0 = x[0], * x1 = x[1], * x2 = x[2], * x3 = x[3];
+    __asm__ volatile(
+        "movi v23.4s, #0\n"
+        "movi v24.16b, #32\n" "movi v25.16b, #0x0f\n" "movi v26.16b, #0x03\n" "movi v27.16b, #0x0c\n"
+        "movi v28.16b, #0x30\n" "movi v29.16b, #0x04\n" "movi v30.16b, #0x10\n" "movi v31.16b, #0x40\n"
+        "mov x16, #0x0101010101010101\n"
+        "ldur w10, [%[x0], #0]\n"
+        "ldur w11, [%[x1], #0]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x0], #32]\n"
+        "ldur w13, [%[x1], #32]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #0]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #64]\n"
+        "ldur w12, [%[x0], #64]\n"
+        "ldur w13, [%[x1], #64]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #128]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #192]\n"
+        "ldur w10, [%[x2], #0]\n"
+        "ldur w11, [%[x3], #0]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x2], #32]\n"
+        "ldur w13, [%[x3], #32]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #8]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #72]\n"
+        "ldur w12, [%[x2], #64]\n"
+        "ldur w13, [%[x3], #64]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #136]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #200]\n"
+        "ldur w10, [%[x0], #4]\n"
+        "ldur w11, [%[x1], #4]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x0], #36]\n"
+        "ldur w13, [%[x1], #36]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #16]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #80]\n"
+        "ldur w12, [%[x0], #68]\n"
+        "ldur w13, [%[x1], #68]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #144]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #208]\n"
+        "ldur w10, [%[x2], #4]\n"
+        "ldur w11, [%[x3], #4]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x2], #36]\n"
+        "ldur w13, [%[x3], #36]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #24]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #88]\n"
+        "ldur w12, [%[x2], #68]\n"
+        "ldur w13, [%[x3], #68]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #152]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #216]\n"
+        "ldur w10, [%[x0], #8]\n"
+        "ldur w11, [%[x1], #8]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x0], #40]\n"
+        "ldur w13, [%[x1], #40]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #32]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #96]\n"
+        "ldur w12, [%[x0], #72]\n"
+        "ldur w13, [%[x1], #72]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #160]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #224]\n"
+        "ldur w10, [%[x2], #8]\n"
+        "ldur w11, [%[x3], #8]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x2], #40]\n"
+        "ldur w13, [%[x3], #40]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #40]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #104]\n"
+        "ldur w12, [%[x2], #72]\n"
+        "ldur w13, [%[x3], #72]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #168]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #232]\n"
+        "ldur w10, [%[x0], #12]\n"
+        "ldur w11, [%[x1], #12]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x0], #44]\n"
+        "ldur w13, [%[x1], #44]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #48]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #112]\n"
+        "ldur w12, [%[x0], #76]\n"
+        "ldur w13, [%[x1], #76]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #176]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #240]\n"
+        "ldur w10, [%[x2], #12]\n"
+        "ldur w11, [%[x3], #12]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x2], #44]\n"
+        "ldur w13, [%[x3], #44]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #56]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #120]\n"
+        "ldur w12, [%[x2], #76]\n"
+        "ldur w13, [%[x3], #76]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #184]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #248]\n"
+        "ldur w10, [%[x0], #16]\n"
+        "ldur w11, [%[x1], #16]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x0], #48]\n"
+        "ldur w13, [%[x1], #48]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #256]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #320]\n"
+        "ldur w12, [%[x0], #80]\n"
+        "ldur w13, [%[x1], #80]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #384]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #448]\n"
+        "ldur w10, [%[x2], #16]\n"
+        "ldur w11, [%[x3], #16]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x2], #48]\n"
+        "ldur w13, [%[x3], #48]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #264]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #328]\n"
+        "ldur w12, [%[x2], #80]\n"
+        "ldur w13, [%[x3], #80]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #392]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #456]\n"
+        "ldur w10, [%[x0], #20]\n"
+        "ldur w11, [%[x1], #20]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x0], #52]\n"
+        "ldur w13, [%[x1], #52]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #272]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #336]\n"
+        "ldur w12, [%[x0], #84]\n"
+        "ldur w13, [%[x1], #84]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #400]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #464]\n"
+        "ldur w10, [%[x2], #20]\n"
+        "ldur w11, [%[x3], #20]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x2], #52]\n"
+        "ldur w13, [%[x3], #52]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #280]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #344]\n"
+        "ldur w12, [%[x2], #84]\n"
+        "ldur w13, [%[x3], #84]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #408]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #472]\n"
+        "ldur w10, [%[x0], #24]\n"
+        "ldur w11, [%[x1], #24]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x0], #56]\n"
+        "ldur w13, [%[x1], #56]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #288]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #352]\n"
+        "ldur w12, [%[x0], #88]\n"
+        "ldur w13, [%[x1], #88]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #416]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #480]\n"
+        "ldur w10, [%[x2], #24]\n"
+        "ldur w11, [%[x3], #24]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x2], #56]\n"
+        "ldur w13, [%[x3], #56]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #296]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #360]\n"
+        "ldur w12, [%[x2], #88]\n"
+        "ldur w13, [%[x3], #88]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #424]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #488]\n"
+        "ldur w10, [%[x0], #28]\n"
+        "ldur w11, [%[x1], #28]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x0], #60]\n"
+        "ldur w13, [%[x1], #60]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #304]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #368]\n"
+        "ldur w12, [%[x0], #92]\n"
+        "ldur w13, [%[x1], #92]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #432]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #496]\n"
+        "ldur w10, [%[x2], #28]\n"
+        "ldur w11, [%[x3], #28]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur w12, [%[x2], #60]\n"
+        "ldur w13, [%[x3], #60]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #0\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #312]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #1\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #376]\n"
+        "ldur w12, [%[x2], #92]\n"
+        "ldur w13, [%[x3], #92]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and x15, x16, x10, lsr #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #440]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "and x15, x16, x10, lsr #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "str x14, [%[bn], #504]\n"
+        "mov x17, %[bc]\n"
+        "mov %[bc], %[bn]\n"
+        "mov %[bn], x17\n"
+        "1:\n"
+        "ldur q0, [%[x0], #94]\n"
+        "ldur w10, [%[x0], #110]\n"
+        "ldur w11, [%[x1], #110]\n"
+        "ldur q1, [%[x1], #94]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldur q2, [%[x2], #94]\n"
+        "ldur w12, [%[x0], #142]\n"
+        "ldur q3, [%[x3], #94]\n"
+        "ldur w13, [%[x1], #142]\n"
+        "ext v0.16b, v0.16b, v0.16b, #2\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ext v1.16b, v1.16b, v1.16b, #2\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "ext v2.16b, v2.16b, v2.16b, #2\n"
+        "and x15, x16, x10, lsr #0\n"
+        "ext v3.16b, v3.16b, v3.16b, #2\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "trn1 v4.4s, v0.4s, v1.4s\n"
+        "str x14, [%[bn], #0]\n"
+        "trn2 v5.4s, v0.4s, v1.4s\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "trn1 v6.4s, v2.4s, v3.4s\n"
+        "and x15, x16, x10, lsr #1\n"
+        "trn2 v7.4s, v2.4s, v3.4s\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "trn1 v0.2d, v4.2d, v6.2d\n"
+        "str x14, [%[bn], #64]\n"
+        "trn1 v1.2d, v5.2d, v7.2d\n"
+        "ldur w12, [%[x0], #174]\n"
+        "trn2 v2.2d, v4.2d, v6.2d\n"
+        "ldur w13, [%[x1], #174]\n"
+        "trn2 v3.2d, v5.2d, v7.2d\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ldr s17, [%[y]]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "xtn v3.4h, v3.4s\n"
+        "and x15, x16, x10, lsr #4\n"
+        "fcvtl v22.4s, v3.4h\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "fmul v22.4s, v22.4s, v17.s[0]\n"
+        "str x14, [%[bn], #128]\n"
+        "and v12.16b, v0.16b, v25.16b\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "shl v4.16b, v2.16b, #4\n"
+        "and x15, x16, x10, lsr #5\n"
+        "bit v12.16b, v4.16b, v28.16b\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "and v13.16b, v1.16b, v25.16b\n"
+        "str x14, [%[bn], #192]\n"
+        "shl v5.16b, v2.16b, #2\n"
+        "ldur w10, [%[x2], #110]\n"
+        "bit v13.16b, v5.16b, v28.16b\n"
+        "ldur w11, [%[x3], #110]\n"
+        "ushr v14.16b, v0.16b, #4\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "bit v14.16b, v2.16b, v28.16b\n"
+        "ldur w12, [%[x2], #142]\n"
+        "ushr v15.16b, v1.16b, #4\n"
+        "ldur w13, [%[x3], #142]\n"
+        "ushr v6.16b, v2.16b, #2\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "bit v15.16b, v6.16b, v28.16b\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "ldr q4, [%[x0], #0]\n"
+        "and x15, x16, x10, lsr #0\n"
+        "ldr q5, [%[x1], #0]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "ldr q6, [%[x2], #0]\n"
+        "str x14, [%[bn], #8]\n"
+        "ldr q7, [%[x3], #0]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "and x15, x16, x10, lsr #1\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "str x14, [%[bn], #72]\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "ldur w12, [%[x2], #174]\n"
+        "trn1 v0.2d, v8.2d, v10.2d\n"
+        "ldur w13, [%[x3], #174]\n"
+        "trn1 v1.2d, v9.2d, v11.2d\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "trn2 v2.2d, v8.2d, v10.2d\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "trn2 v3.2d, v9.2d, v11.2d\n"
+        "and x15, x16, x10, lsr #4\n"
+        "ldr q4, [%[x0], #32]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "ldr q5, [%[x1], #32]\n"
+        "str x14, [%[bn], #136]\n"
+        "ldr q6, [%[x2], #32]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "ldr q7, [%[x3], #32]\n"
+        "and x15, x16, x10, lsr #5\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "str x14, [%[bn], #200]\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "ldur w10, [%[x0], #114]\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "ldur w11, [%[x1], #114]\n"
+        "trn1 v4.2d, v8.2d, v10.2d\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "trn1 v5.2d, v9.2d, v11.2d\n"
+        "ldur w12, [%[x0], #146]\n"
+        "trn2 v6.2d, v8.2d, v10.2d\n"
+        "ldur w13, [%[x1], #146]\n"
+        "trn2 v7.2d, v9.2d, v11.2d\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ldr q19, [%[ix], #0]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "tbl v8.16b, { v12.16b, v13.16b }, v19.16b\n"
+        "and x15, x16, x10, lsr #0\n"
+        "ssubl v9.8h, v8.8b, v24.8b\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "ssubl2 v10.8h, v8.16b, v24.16b\n"
+        "str x14, [%[bn], #16]\n"
+        "sshll v8.4s, v9.4h, #4\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sshll2 v9.4s, v9.8h, #2\n"
+        "and x15, x16, x10, lsr #1\n"
+        "sshll2 v11.4s, v10.8h, #4\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "sshll v10.4s, v10.4h, #0\n"
+        "str x14, [%[bn], #80]\n"
+        "ldr q17, [%[y], #4]\n"
+        "ldur w12, [%[x0], #178]\n"
+        "ldrsh w9, [%[y], #260]\n"
+        "ldur w13, [%[x1], #178]\n"
+        "neg w9, w9, lsl #2\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "dup v18.4s, w9\n"
+        "and x15, x16, x10, lsr #4\n"
+        "ldr q19, [%[bc], #0]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "str x14, [%[bn], #144]\n"
+        "ldr q20, [%[bc], #16]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and x15, x16, x10, lsr #5\n"
+        "ldr q21, [%[bc], #32]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "str x14, [%[bn], #208]\n"
+        "ldr q19, [%[bc], #48]\n"
+        "ldur w10, [%[x2], #114]\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "ldur w11, [%[x3], #114]\n"
+        "mul v16.4s, v18.4s, v8.4s\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldr q17, [%[y], #36]\n"
+        "ldur w12, [%[x2], #146]\n"
+        "ldrsh w9, [%[y], #264]\n"
+        "ldur w13, [%[x3], #146]\n"
+        "neg w9, w9, lsl #4\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "dup v18.4s, w9\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "ldr q19, [%[bc], #64]\n"
+        "and x15, x16, x10, lsr #0\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "ldr q20, [%[bc], #80]\n"
+        "str x14, [%[bn], #24]\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "ldr q21, [%[bc], #96]\n"
+        "and x15, x16, x10, lsr #1\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "ldr q19, [%[bc], #112]\n"
+        "str x14, [%[bn], #88]\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "ldur w12, [%[x2], #178]\n"
+        "mla v16.4s, v18.4s, v9.4s\n"
+        "ldur w13, [%[x3], #178]\n"
+        "ldr q17, [%[y], #68]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ldrsh w9, [%[y], #268]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "neg w9, w9, lsl #6\n"
+        "and x15, x16, x10, lsr #4\n"
+        "dup v18.4s, w9\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "shl v19.16b, v0.16b, #4\n"
+        "str x14, [%[bn], #152]\n"
+        "and v19.16b, v19.16b, v31.16b\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "bit v19.16b, v4.16b, v28.16b\n"
+        "and x15, x16, x10, lsr #5\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "shl v20.16b, v1.16b, #4\n"
+        "str x14, [%[bn], #216]\n"
+        "and v20.16b, v20.16b, v31.16b\n"
+        "ldur w10, [%[x0], #118]\n"
+        "bit v20.16b, v5.16b, v28.16b\n"
+        "ldur w11, [%[x1], #118]\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "shl v21.16b, v2.16b, #4\n"
+        "ldur w12, [%[x0], #150]\n"
+        "and v21.16b, v21.16b, v31.16b\n"
+        "ldur w13, [%[x1], #150]\n"
+        "bit v21.16b, v6.16b, v28.16b\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "shl v19.16b, v3.16b, #4\n"
+        "and x15, x16, x10, lsr #0\n"
+        "and v19.16b, v19.16b, v31.16b\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "bit v19.16b, v7.16b, v28.16b\n"
+        "str x14, [%[bn], #32]\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "mla v16.4s, v18.4s, v10.4s\n"
+        "and x15, x16, x10, lsr #1\n"
+        "ldr q17, [%[y], #100]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "ldrsh w9, [%[y], #272]\n"
+        "str x14, [%[bn], #96]\n"
+        "neg w9, w9, lsl #2\n"
+        "ldur w12, [%[x0], #182]\n"
+        "dup v18.4s, w9\n"
+        "ldur w13, [%[x1], #182]\n"
+        "ushr v19.16b, v0.16b, #1\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "sri v19.16b, v4.16b, #6\n"
+        "and x15, x16, x10, lsr #4\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "ushr v20.16b, v1.16b, #1\n"
+        "str x14, [%[bn], #160]\n"
+        "and v20.16b, v20.16b, v29.16b\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sri v20.16b, v5.16b, #6\n"
+        "and x15, x16, x10, lsr #5\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "ushr v21.16b, v2.16b, #1\n"
+        "str x14, [%[bn], #224]\n"
+        "and v21.16b, v21.16b, v29.16b\n"
+        "ldur w10, [%[x2], #118]\n"
+        "sri v21.16b, v6.16b, #6\n"
+        "ldur w11, [%[x3], #118]\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ushr v19.16b, v3.16b, #1\n"
+        "ldur w12, [%[x2], #150]\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "ldur w13, [%[x3], #150]\n"
+        "sri v19.16b, v7.16b, #6\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "mla v16.4s, v18.4s, v11.4s\n"
+        "and x15, x16, x10, lsr #0\n"
+        "ldr q4, [%[x0], #64]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #40]\n"
+        "ldr q5, [%[x1], #64]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "ldr q6, [%[x2], #64]\n"
+        "and x15, x16, x10, lsr #1\n"
+        "ldr q7, [%[x3], #64]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "str x14, [%[bn], #104]\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "ldur w12, [%[x2], #182]\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "ldur w13, [%[x3], #182]\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "trn1 v4.2d, v8.2d, v10.2d\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "trn1 v5.2d, v9.2d, v11.2d\n"
+        "and x15, x16, x10, lsr #4\n"
+        "trn2 v6.2d, v8.2d, v10.2d\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "trn2 v7.2d, v9.2d, v11.2d\n"
+        "str x14, [%[bn], #168]\n"
+        "ldr q19, [%[ix], #0]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "tbl v8.16b, { v14.16b, v15.16b }, v19.16b\n"
+        "and x15, x16, x10, lsr #5\n"
+        "ssubl v9.8h, v8.8b, v24.8b\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "ssubl2 v10.8h, v8.16b, v24.16b\n"
+        "str x14, [%[bn], #232]\n"
+        "sshll v8.4s, v9.4h, #4\n"
+        "ldur w10, [%[x0], #122]\n"
+        "sshll2 v9.4s, v9.8h, #2\n"
+        "ldur w11, [%[x1], #122]\n"
+        "sshll2 v11.4s, v10.8h, #4\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "sshll v10.4s, v10.4h, #0\n"
+        "ldur w12, [%[x0], #154]\n"
+        "ldr q17, [%[y], #132]\n"
+        "ldur w13, [%[x1], #154]\n"
+        "ldrsh w9, [%[y], #276]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "neg w9, w9, lsl #2\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "dup v18.4s, w9\n"
+        "and x15, x16, x10, lsr #0\n"
+        "ldr q19, [%[bc], #128]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "str x14, [%[bn], #48]\n"
+        "ldr q20, [%[bc], #144]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and x15, x16, x10, lsr #1\n"
+        "ldr q21, [%[bc], #160]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "str x14, [%[bn], #112]\n"
+        "ldr q19, [%[bc], #176]\n"
+        "ldur w12, [%[x0], #186]\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "ldur w13, [%[x1], #186]\n"
+        "mla v16.4s, v18.4s, v8.4s\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ldr q17, [%[y], #164]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "ldrsh w9, [%[y], #280]\n"
+        "and x15, x16, x10, lsr #4\n"
+        "neg w9, w9, lsl #4\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "dup v18.4s, w9\n"
+        "str x14, [%[bn], #176]\n"
+        "ldr q19, [%[bc], #192]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "and x15, x16, x10, lsr #5\n"
+        "ldr q20, [%[bc], #208]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "str x14, [%[bn], #240]\n"
+        "ldr q21, [%[bc], #224]\n"
+        "ldur w10, [%[x2], #122]\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ldur w11, [%[x3], #122]\n"
+        "ldr q19, [%[bc], #240]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "ldur w12, [%[x2], #154]\n"
+        "mla v16.4s, v18.4s, v9.4s\n"
+        "ldur w13, [%[x3], #154]\n"
+        "ldr q17, [%[y], #196]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ldrsh w9, [%[y], #284]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "neg w9, w9, lsl #6\n"
+        "and x15, x16, x10, lsr #0\n"
+        "dup v18.4s, w9\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "and v19.16b, v0.16b, v31.16b\n"
+        "str x14, [%[bn], #56]\n"
+        "bit v19.16b, v4.16b, v28.16b\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "and x15, x16, x10, lsr #1\n"
+        "and v20.16b, v1.16b, v31.16b\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "bit v20.16b, v5.16b, v28.16b\n"
+        "str x14, [%[bn], #120]\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ldur w12, [%[x2], #186]\n"
+        "and v21.16b, v2.16b, v31.16b\n"
+        "ldur w13, [%[x3], #186]\n"
+        "bit v21.16b, v6.16b, v28.16b\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "and v19.16b, v3.16b, v31.16b\n"
+        "and x15, x16, x10, lsr #4\n"
+        "bit v19.16b, v7.16b, v28.16b\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "str x14, [%[bn], #184]\n"
+        "mla v16.4s, v18.4s, v10.4s\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "ldr q17, [%[y], #228]\n"
+        "and x15, x16, x10, lsr #5\n"
+        "ldrsh w9, [%[y], #288]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "neg w9, w9, lsl #2\n"
+        "str x14, [%[bn], #248]\n"
+        "dup v18.4s, w9\n"
+        "ldur w10, [%[x0], #126]\n"
+        "ldur w11, [%[x1], #126]\n"
+        "ushr v19.16b, v0.16b, #5\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "sri v19.16b, v4.16b, #6\n"
+        "ldur w12, [%[x0], #158]\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "ldur w13, [%[x1], #158]\n"
+        "ushr v20.16b, v1.16b, #5\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "sri v20.16b, v5.16b, #6\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and x15, x16, x10, lsr #0\n"
+        "ushr v21.16b, v2.16b, #5\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "sri v21.16b, v6.16b, #6\n"
+        "str x14, [%[bn], #256]\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "ushr v19.16b, v3.16b, #5\n"
+        "and x15, x16, x10, lsr #1\n"
+        "sri v19.16b, v7.16b, #6\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "str x14, [%[bn], #320]\n"
+        "mla v16.4s, v18.4s, v11.4s\n"
+        "ldur w12, [%[x0], #190]\n"
+        "ldr q4, [%[x0], #16]\n"
+        "ldur w13, [%[x1], #190]\n"
+        "ldr q5, [%[x1], #16]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ldr q6, [%[x2], #16]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "ldr q7, [%[x3], #16]\n"
+        "and x15, x16, x10, lsr #4\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "str x14, [%[bn], #384]\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "and x15, x16, x10, lsr #5\n"
+        "trn1 v0.2d, v8.2d, v10.2d\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "trn1 v1.2d, v9.2d, v11.2d\n"
+        "str x14, [%[bn], #448]\n"
+        "trn2 v2.2d, v8.2d, v10.2d\n"
+        "ldur w10, [%[x2], #126]\n"
+        "trn2 v3.2d, v9.2d, v11.2d\n"
+        "ldur w11, [%[x3], #126]\n"
+        "ldr q4, [%[x0], #48]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldr q5, [%[x1], #48]\n"
+        "ldur w12, [%[x2], #158]\n"
+        "ldr q6, [%[x2], #48]\n"
+        "ldur w13, [%[x3], #158]\n"
+        "ldr q7, [%[x3], #48]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "and x15, x16, x10, lsr #0\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "str x14, [%[bn], #264]\n"
+        "trn1 v4.2d, v8.2d, v10.2d\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "trn1 v5.2d, v9.2d, v11.2d\n"
+        "and x15, x16, x10, lsr #1\n"
+        "trn2 v6.2d, v8.2d, v10.2d\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "trn2 v7.2d, v9.2d, v11.2d\n"
+        "str x14, [%[bn], #328]\n"
+        "ldr q19, [%[ix], #16]\n"
+        "ldur w12, [%[x2], #190]\n"
+        "tbl v8.16b, { v12.16b, v13.16b }, v19.16b\n"
+        "ldur w13, [%[x3], #190]\n"
+        "ssubl v9.8h, v8.8b, v24.8b\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ssubl2 v10.8h, v8.16b, v24.16b\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "sshll v8.4s, v9.4h, #4\n"
+        "and x15, x16, x10, lsr #4\n"
+        "sshll2 v9.4s, v9.8h, #2\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "sshll2 v11.4s, v10.8h, #4\n"
+        "str x14, [%[bn], #392]\n"
+        "sshll v10.4s, v10.4h, #0\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "ldr q17, [%[y], #20]\n"
+        "and x15, x16, x10, lsr #5\n"
+        "ldrsh w9, [%[y], #262]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "neg w9, w9, lsl #2\n"
+        "str x14, [%[bn], #456]\n"
+        "dup v18.4s, w9\n"
+        "ldur w10, [%[x0], #130]\n"
+        "ldr q19, [%[bc], #256]\n"
+        "ldur w11, [%[x1], #130]\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldr q20, [%[bc], #272]\n"
+        "ldur w12, [%[x0], #162]\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ldur w13, [%[x1], #162]\n"
+        "ldr q21, [%[bc], #288]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "ldr q19, [%[bc], #304]\n"
+        "and x15, x16, x10, lsr #0\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "mla v16.4s, v18.4s, v8.4s\n"
+        "str x14, [%[bn], #272]\n"
+        "ldr q17, [%[y], #52]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "ldrsh w9, [%[y], #266]\n"
+        "and x15, x16, x10, lsr #1\n"
+        "neg w9, w9, lsl #4\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "dup v18.4s, w9\n"
+        "str x14, [%[bn], #336]\n"
+        "ldr q19, [%[bc], #320]\n"
+        "ldur w12, [%[x0], #194]\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "ldur w13, [%[x1], #194]\n"
+        "ldr q20, [%[bc], #336]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and x15, x16, x10, lsr #4\n"
+        "ldr q21, [%[bc], #352]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "str x14, [%[bn], #400]\n"
+        "ldr q19, [%[bc], #368]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "and x15, x16, x10, lsr #5\n"
+        "mla v16.4s, v18.4s, v9.4s\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "ldr q17, [%[y], #84]\n"
+        "str x14, [%[bn], #464]\n"
+        "ldrsh w9, [%[y], #270]\n"
+        "ldur w10, [%[x2], #130]\n"
+        "neg w9, w9, lsl #6\n"
+        "ldur w11, [%[x3], #130]\n"
+        "dup v18.4s, w9\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "shl v19.16b, v0.16b, #4\n"
+        "ldur w12, [%[x2], #162]\n"
+        "and v19.16b, v19.16b, v31.16b\n"
+        "ldur w13, [%[x3], #162]\n"
+        "bit v19.16b, v4.16b, v28.16b\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "shl v20.16b, v1.16b, #4\n"
+        "and x15, x16, x10, lsr #0\n"
+        "and v20.16b, v20.16b, v31.16b\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "bit v20.16b, v5.16b, v28.16b\n"
+        "str x14, [%[bn], #280]\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "shl v21.16b, v2.16b, #4\n"
+        "and x15, x16, x10, lsr #1\n"
+        "and v21.16b, v21.16b, v31.16b\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "bit v21.16b, v6.16b, v28.16b\n"
+        "str x14, [%[bn], #344]\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ldur w12, [%[x2], #194]\n"
+        "shl v19.16b, v3.16b, #4\n"
+        "ldur w13, [%[x3], #194]\n"
+        "and v19.16b, v19.16b, v31.16b\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "bit v19.16b, v7.16b, v28.16b\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "and x15, x16, x10, lsr #4\n"
+        "mla v16.4s, v18.4s, v10.4s\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "ldr q17, [%[y], #116]\n"
+        "str x14, [%[bn], #408]\n"
+        "ldrsh w9, [%[y], #274]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "neg w9, w9, lsl #2\n"
+        "and x15, x16, x10, lsr #5\n"
+        "dup v18.4s, w9\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "ushr v19.16b, v0.16b, #1\n"
+        "str x14, [%[bn], #472]\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "ldur w10, [%[x0], #134]\n"
+        "sri v19.16b, v4.16b, #6\n"
+        "ldur w11, [%[x1], #134]\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ushr v20.16b, v1.16b, #1\n"
+        "ldur w12, [%[x0], #166]\n"
+        "and v20.16b, v20.16b, v29.16b\n"
+        "ldur w13, [%[x1], #166]\n"
+        "sri v20.16b, v5.16b, #6\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "ushr v21.16b, v2.16b, #1\n"
+        "and x15, x16, x10, lsr #0\n"
+        "and v21.16b, v21.16b, v29.16b\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "sri v21.16b, v6.16b, #6\n"
+        "str x14, [%[bn], #288]\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "ushr v19.16b, v3.16b, #1\n"
+        "and x15, x16, x10, lsr #1\n"
+        "and v19.16b, v19.16b, v29.16b\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "sri v19.16b, v7.16b, #6\n"
+        "str x14, [%[bn], #352]\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "ldur w12, [%[x0], #198]\n"
+        "mla v16.4s, v18.4s, v11.4s\n"
+        "ldur w13, [%[x1], #198]\n"
+        "ldr q4, [%[x0], #80]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ldr q5, [%[x1], #80]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "ldr q6, [%[x2], #80]\n"
+        "and x15, x16, x10, lsr #4\n"
+        "ldr q7, [%[x3], #80]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "trn1 v8.4s, v4.4s, v5.4s\n"
+        "str x14, [%[bn], #416]\n"
+        "trn2 v9.4s, v4.4s, v5.4s\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "trn1 v10.4s, v6.4s, v7.4s\n"
+        "and x15, x16, x10, lsr #5\n"
+        "trn2 v11.4s, v6.4s, v7.4s\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "trn1 v4.2d, v8.2d, v10.2d\n"
+        "str x14, [%[bn], #480]\n"
+        "trn1 v5.2d, v9.2d, v11.2d\n"
+        "ldur w10, [%[x2], #134]\n"
+        "trn2 v6.2d, v8.2d, v10.2d\n"
+        "ldur w11, [%[x3], #134]\n"
+        "trn2 v7.2d, v9.2d, v11.2d\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "ldr q19, [%[ix], #16]\n"
+        "ldur w12, [%[x2], #166]\n"
+        "tbl v8.16b, { v14.16b, v15.16b }, v19.16b\n"
+        "ldur w13, [%[x3], #166]\n"
+        "ssubl v9.8h, v8.8b, v24.8b\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ssubl2 v10.8h, v8.16b, v24.16b\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "sshll v8.4s, v9.4h, #4\n"
+        "and x15, x16, x10, lsr #0\n"
+        "sshll2 v9.4s, v9.8h, #2\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "str x14, [%[bn], #296]\n"
+        "sshll2 v11.4s, v10.8h, #4\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sshll v10.4s, v10.4h, #0\n"
+        "and x15, x16, x10, lsr #1\n"
+        "ldr q17, [%[y], #148]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "ldrsh w9, [%[y], #278]\n"
+        "str x14, [%[bn], #360]\n"
+        "neg w9, w9, lsl #2\n"
+        "ldur w12, [%[x2], #198]\n"
+        "dup v18.4s, w9\n"
+        "ldur w13, [%[x3], #198]\n"
+        "ldr q19, [%[bc], #384]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "ldr q20, [%[bc], #400]\n"
+        "and x15, x16, x10, lsr #4\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "ldr q21, [%[bc], #416]\n"
+        "str x14, [%[bn], #424]\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "ldr q19, [%[bc], #432]\n"
+        "and x15, x16, x10, lsr #5\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "mla v16.4s, v18.4s, v8.4s\n"
+        "str x14, [%[bn], #488]\n"
+        "ldr q17, [%[y], #180]\n"
+        "ldur w10, [%[x0], #138]\n"
+        "ldrsh w9, [%[y], #282]\n"
+        "ldur w11, [%[x1], #138]\n"
+        "neg w9, w9, lsl #4\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "dup v18.4s, w9\n"
+        "ldur w12, [%[x0], #170]\n"
+        "ldr q19, [%[bc], #448]\n"
+        "ldur w13, [%[x1], #170]\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ldr q20, [%[bc], #464]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and x15, x16, x10, lsr #0\n"
+        "ldr q21, [%[bc], #480]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "str x14, [%[bn], #304]\n"
+        "ldr q19, [%[bc], #496]\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "and x15, x16, x10, lsr #1\n"
+        "mla v16.4s, v18.4s, v9.4s\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "ldr q17, [%[y], #212]\n"
+        "str x14, [%[bn], #368]\n"
+        "ldrsh w9, [%[y], #286]\n"
+        "ldur w12, [%[x0], #202]\n"
+        "neg w9, w9, lsl #6\n"
+        "ldur w13, [%[x1], #202]\n"
+        "dup v18.4s, w9\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "and v19.16b, v0.16b, v31.16b\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "bit v19.16b, v4.16b, v28.16b\n"
+        "and x15, x16, x10, lsr #4\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "and v20.16b, v1.16b, v31.16b\n"
+        "str x14, [%[bn], #432]\n"
+        "bit v20.16b, v5.16b, v28.16b\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "and x15, x16, x10, lsr #5\n"
+        "and v21.16b, v2.16b, v31.16b\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "bit v21.16b, v6.16b, v28.16b\n"
+        "str x14, [%[bn], #496]\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "ldur w10, [%[x2], #138]\n"
+        "and v19.16b, v3.16b, v31.16b\n"
+        "ldur w11, [%[x3], #138]\n"
+        "bit v19.16b, v7.16b, v28.16b\n"
+        "orr x10, x10, x11, lsl #32\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "ldur w12, [%[x2], #170]\n"
+        "mla v16.4s, v18.4s, v10.4s\n"
+        "ldur w13, [%[x3], #170]\n"
+        "ldr q17, [%[y], #244]\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "ldrsh w9, [%[y], #290]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "neg w9, w9, lsl #2\n"
+        "and x15, x16, x10, lsr #0\n"
+        "dup v18.4s, w9\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "ushr v19.16b, v0.16b, #5\n"
+        "str x14, [%[bn], #312]\n"
+        "sri v19.16b, v4.16b, #6\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sdot v18.4s, v19.16b, v17.4b[0]\n"
+        "and x15, x16, x10, lsr #1\n"
+        "ushr v20.16b, v1.16b, #5\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "sri v20.16b, v5.16b, #6\n"
+        "str x14, [%[bn], #376]\n"
+        "sdot v18.4s, v20.16b, v17.4b[1]\n"
+        "ldur w12, [%[x2], #202]\n"
+        "ushr v21.16b, v2.16b, #5\n"
+        "ldur w13, [%[x3], #202]\n"
+        "sri v21.16b, v6.16b, #6\n"
+        "orr x12, x12, x13, lsl #32\n"
+        "sdot v18.4s, v21.16b, v17.4b[2]\n"
+        "and x14, x12, #0x0303030303030303\n"
+        "ushr v19.16b, v3.16b, #5\n"
+        "and x15, x16, x10, lsr #4\n"
+        "sri v19.16b, v7.16b, #6\n"
+        "orr x14, x14, x15, lsl #2\n"
+        "sdot v18.4s, v19.16b, v17.4b[3]\n"
+        "str x14, [%[bn], #440]\n"
+        "mla v16.4s, v18.4s, v11.4s\n"
+        "and x14, x12, #0x0c0c0c0c0c0c0c0c\n"
+        "sshr v16.4s, v16.4s, #4\n"
+        "and x15, x16, x10, lsr #5\n"
+        "scvtf v16.4s, v16.4s\n"
+        "orr x14, x14, x15, lsl #4\n"
+        "fmla v23.4s, v16.4s, v22.4s\n"
+        "str x14, [%[bn], #504]\n"
+        "mov x17, %[bc]\n"
+        "mov %[bc], %[bn]\n"
+        "mov %[bn], x17\n"
+        "add %[x0], %[x0], #110\n"
+        "add %[x1], %[x1], #110\n"
+        "add %[x2], %[x2], #110\n"
+        "add %[x3], %[x3], #110\n"
+        "add %[y], %[y], #292\n"
+        "subs %w[nb], %w[nb], #1\n"
+        "b.ne 1b\n"
+        "str q23, [%[s]]\n"
+        : [x0] "+r"(x0), [x1] "+r"(x1), [x2] "+r"(x2), [x3] "+r"(x3), [y] "+r"(y), [nb] "+r"(nb), [bc] "+r"(bc), [bn] "+r"(bn)
+        : [s] "r"(s), [ix] "r"(ix)
+        : "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory", "cc",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+          "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+}
+
+// The int8 pre-expanded reference ("unpack-free" floor, R33 (b)): per 4 rows and block, the values q2 + 4h as int8 in
+// the kernel's transposed order (group g at 64 g, vector w at 16 w, row r at 4 r), then the rows' scales and d.
+typedef struct { uint8_t v[1024]; uint8_t scales[4][12]; ggml_half d[4]; } ggml_q3k8x4;
+
+static void ggml_q3k_bench_expand(const block_q3_K * const x[4], int nb, ggml_q3k8x4 * out) {
+    for (int i = 0; i < nb; ++i) {
+        for (int g = 0; g < 16; ++g) {
+            const int hf = g/8, k = (g%8)/2, c = g%2;
+            for (int w = 0; w < 4; ++w) for (int r = 0; r < 4; ++r) for (int j = 0; j < 4; ++j) {
+                const int l = 16*c + 4*w + j;
+                out[i].v[64*g + 16*w + 4*r + j] = ((x[r][i].qs[32*hf + l] >> (2*k)) & 3) + 4*((x[r][i].hmask[l] >> (4*hf + k)) & 1);
+            }
+        }
+        for (int r = 0; r < 4; ++r) { memcpy(out[i].scales[r], x[r][i].scales, 12); out[i].d[r] = x[r][i].d; }
+    }
+}
+
+static void ggml_q3k_bench_int8(int nb, float * GGML_RESTRICT s, const ggml_q3k8x4 * GGML_RESTRICT xb, const block_q8_K * GGML_RESTRICT y) {
+    float32x4_t sumv = vdupq_n_f32(0);
+    for (int i = 0; i < nb; ++i) {
+        const ggml_q3k8x4 * b = xb + i;
+        int8x16_t s8[4];
+        for (int r = 0; r < 4; ++r) s8[r] = ggml_q3k_scales_vec(b->scales[r]);
+        const int8x16x2_t z01 = vzipq_s8(s8[0], s8[1]), z23 = vzipq_s8(s8[2], s8[3]);
+        const int16x8x2_t lo = vzipq_s16(vreinterpretq_s16_s8(z01.val[0]), vreinterpretq_s16_s8(z23.val[0]));
+        const int16x8x2_t hi = vzipq_s16(vreinterpretq_s16_s8(z01.val[1]), vreinterpretq_s16_s8(z23.val[1]));
+        const int8x16_t S[4] = { vreinterpretq_s8_s16(lo.val[0]), vreinterpretq_s8_s16(lo.val[1]),
+                                 vreinterpretq_s8_s16(hi.val[0]), vreinterpretq_s8_s16(hi.val[1]) }; // byte 4 (g%4) + r
+        int32x4_t sc32[16];
+        for (int m = 0; m < 4; ++m) {
+            const int16x8_t l = vmovl_s8(vget_low_s8(S[m])), h = vmovl_s8(vget_high_s8(S[m]));
+            sc32[4*m + 0] = vmovl_s16(vget_low_s16(l)); sc32[4*m + 1] = vmovl_s16(vget_high_s16(l));
+            sc32[4*m + 2] = vmovl_s16(vget_low_s16(h)); sc32[4*m + 3] = vmovl_s16(vget_high_s16(h));
+        }
+        int32x4_t isum = vdupq_n_s32(0);
+        for (int g = 0; g < 16; ++g) {
+            const int8x16_t yv = vld1q_s8(y[i].qs + 16*g);
+            const uint8_t * v = b->v + 64*g;
+            int32x4_t a = vdupq_n_s32(-4 * y[i].bsums[g]);
+            a = vdotq_laneq_s32(a, vld1q_s8((const int8_t *) v),      yv, 0);
+            a = vdotq_laneq_s32(a, vld1q_s8((const int8_t *) v + 16), yv, 1);
+            a = vdotq_laneq_s32(a, vld1q_s8((const int8_t *) v + 32), yv, 2);
+            a = vdotq_laneq_s32(a, vld1q_s8((const int8_t *) v + 48), yv, 3);
+            isum = vmlaq_s32(isum, a, sc32[g]);
+        }
+        const float32x4_t xd = { GGML_CPU_FP16_TO_FP32(b->d[0]), GGML_CPU_FP16_TO_FP32(b->d[1]),
+                                 GGML_CPU_FP16_TO_FP32(b->d[2]), GGML_CPU_FP16_TO_FP32(b->d[3]) };
+        sumv = vfmaq_f32(sumv, vmulq_n_f32(xd, y[i].d), vcvtq_f32_s32(isum));
+    }
+    vst1q_f32(s, sumv);
+}
+
+void ggml_cpu_head2_q4_0_pack4(void * dst, const void * src, int64_t nb, int il); // repack.cpp
+void ggml_gemv_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+
+static uint32_t ggml_q3k_bench_rng = 12345;
+static uint32_t ggml_q3k_bench_rand(void) { ggml_q3k_bench_rng = ggml_q3k_bench_rng*1664525u + 1013904223u; return ggml_q3k_bench_rng >> 8; }
+
+// Vollie r13b (R40 amendment): every timed trial checks its core. The bench thread is pinned to the A78s {4,5,6} before each
+// shape (the pin alone did not hold in r13: the thread was moved to an A55 after one sched_getcpu); a trial counts only if
+// sched_getcpu() at its start and its end are both in {4,5,6}. Off Linux there is no core id: every trial counts, cpu=-1.
+typedef struct { int first, last, migr, mhz_min, mhz_max; } ggml_q3k_bench_cpu;
+
+// Vollie r11: the core's current clock in MHz (cpufreq scaling_cur_freq, kHz), -1 if unreadable (host, cpu < 0).
+static int ggml_q3k_bench_mhz(int cpu) {
+    char path[96]; long khz = -1000;
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
+    FILE * fp = cpu >= 0 ? fopen(path, "r") : NULL;
+    if (fp) { if (fscanf(fp, "%ld", &khz) != 1) khz = -1000; fclose(fp); }
+    return (int) (khz / 1000);
+}
+
+static int ggml_q3k_bench_pin(void) {
+#if defined(__linux__)
+    cpu_set_t big;
+    CPU_ZERO(&big);
+    CPU_SET(4, &big); CPU_SET(5, &big); CPU_SET(6, &big);
+    return sched_setaffinity(0, sizeof big, &big) == 0;
+#else
+    return 0;
+#endif
+}
+
+// The core now; counts a migration whenever it differs from the previous reading of this line.
+static int ggml_q3k_bench_see(ggml_q3k_bench_cpu * s) {
+#if defined(__linux__)
+    const int c = sched_getcpu();
+#else
+    const int c = -1;
+#endif
+    if (s->first == -2) s->first = c; else if (c != s->last) s->migr++;
+    s->last = c;
+    return c;
+}
+
+// A trial ran from core c0 to c1: valid iff both are A78s (always off Linux); a valid trial logs c1's clock.
+static int ggml_q3k_bench_valid(ggml_q3k_bench_cpu * s, int c0, int c1) {
+#if defined(__linux__)
+    if (c0 < 4 || c0 > 6 || c1 < 4 || c1 > 6) return 0;
+#else
+    GGML_UNUSED(c0);
+#endif
+    const int m = ggml_q3k_bench_mhz(c1);
+    s->mhz_min = s->mhz_min < 0 || m < s->mhz_min ? m : s->mhz_min;
+    s->mhz_max = m > s->mhz_max ? m : s->mhz_max;
+    return 1;
+}
+
+static double ggml_q3k_bench_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec*1e9 + ts.tv_nsec;
+}
+
+static int ggml_q3k_bench_cmp(const void * a, const void * b) {
+    const double x = *(const double *) a, y = *(const double *) b;
+    return (x > y) - (x < y);
+}
+
+// Median of the n valid samples (-1 if none).
+static double ggml_q3k_bench_median(double * v, int n) {
+    if (n == 0) return -1;
+    qsort(v, n, sizeof *v, ggml_q3k_bench_cmp);
+    return n % 2 ? v[n/2] : 0.5*(v[n/2 - 1] + v[n/2]);
+}
+
+// The cold arena (one per bench call): GGML_Q3K_SLOTS of 4-KB-aligned copies of the bench slice, then GGML_Q3K_STREAM bytes
+// written after every fill so the fill's tail is not in L3 / the system cache when the first cold trial runs.
+#define GGML_Q3K_SLOTS  ((size_t) 32 << 20)
+#define GGML_Q3K_STREAM ((size_t) 16 << 20)
+
+// One pass of the new kernel over slice w in the in-situ order (32-row chunks, 4-row groups); touch = GGML_MMID_TOUCH's
+// page-head loads at each chunk start. Returns ns/row; *c0 / *c1 = the core at its start and end.
+static double ggml_q3k_bench_pass(ggml_q3k_bench_cpu * s, int * c0, int * c1, const uint8_t * w, int rows, int nb, size_t bx,
+                                  int touch, float * out, const block_q8_K * yk) {
+    *c0 = ggml_q3k_bench_see(s);
+    const double t0 = ggml_q3k_bench_now();
+    for (int r = 0; r < rows; r += 4) {
+        if (touch && r % 32 == 0) {
+            ggml_cpu_page_touch(w + r*bx, (size_t) (rows - r < 32 ? rows - r : 32)*bx);
+        }
+        const block_q3_K * x[4] = { (const block_q3_K *) (w + r*bx), (const block_q3_K *) (w + (r + 1)*bx),
+                                    (const block_q3_K *) (w + (r + 2)*bx), (const block_q3_K *) (w + (r + 3)*bx) };
+        ggml_vec_dot_q3_K_q8_K_x4_kern(nb, out + r, x, yk);
+    }
+    const double ns = (ggml_q3k_bench_now() - t0) / rows;
+    *c1 = ggml_q3k_bench_see(s);
+    return ns;
+}
+
+// One shape: ns/row. old/new/int8/q4x4/scalar: best of the valid trials of 3 rounds x 7 (2 passes over all rows each, kernels
+// interleaved per round). r13b: then 21 x (cold = 1 pass on a fresh arena slice; hot = the same slice again at once; cold_touch =
+// 1 pass with the page-head loads on another fresh slice), slices >= 8 MB apart and never reused within the shape; medians of
+// the valid trials. cpu_ok = the fewest valid trials of any field / 21. Fills line; returns 0 if a buffer could not be allocated.
+static int ggml_q3k_bench_shape(int K, int rows, uint8_t * arena, char * line, size_t len) {
+    const int nb = K/QK_K;
+    const size_t bx = (size_t) nb*sizeof(block_q3_K), b40 = (size_t) (K/QK4_0)*sizeof(block_q4_0);
+    uint8_t * w    = malloc(bx*rows + 4*sizeof(block_q3_K));  // + the scalar prototype's look-ahead
+    ggml_q3k8x4 * x8 = malloc((size_t) rows/4*nb*sizeof(ggml_q3k8x4));
+    float * f      = malloc((size_t) K*rows*sizeof(float));
+    uint8_t * q40  = malloc(b40*rows), * q4x4 = malloc(b40*rows);
+    block_q8_K * yk = malloc(nb*sizeof(block_q8_K));
+    block_q8_0 * y0 = malloc((K/QK8_0)*sizeof(block_q8_0));
+    float * out[8];
+    int ok = w && x8 && f && q40 && q4x4 && yk && y0;
+    for (int v = 0; v < 8; ++v) { out[v] = malloc(rows*sizeof(float)); ok = ok && out[v]; }
+    if (ok) {
+        for (size_t i = 0; i < bx*rows + 4*sizeof(block_q3_K); ++i) w[i] = (uint8_t) ggml_q3k_bench_rand();
+        for (int r = 0; r < rows; ++r) for (int b = 0; b < nb; ++b) {
+            ((block_q3_K *) (w + r*bx))[b].d = GGML_CPU_FP32_TO_FP16(0.01f + (ggml_q3k_bench_rand() % 1000)*1e-5f);
+        }
+        for (size_t i = 0; i < (size_t) K*rows; ++i) f[i] = (float) (ggml_q3k_bench_rand() % 2001) / 1000.0f - 1.0f;
+        quantize_row_q8_K(f, yk, K);
+        quantize_row_q8_0(f, y0, K);
+        for (int r = 0; r < rows; ++r) quantize_row_q4_0_ref(f + (size_t) r*K, (block_q4_0 *) (q40 + r*b40), K);
+        for (int r = 0; r < rows; r += 4) ggml_cpu_head2_q4_0_pack4(q4x4 + r*b40, q40 + r*b40, K/QK4_0, 4);
+        for (int r = 0; r < rows; r += 4) {
+            const block_q3_K * x[4] = { (const block_q3_K *) (w + r*bx), (const block_q3_K *) (w + (r + 1)*bx),
+                                        (const block_q3_K *) (w + (r + 2)*bx), (const block_q3_K *) (w + (r + 3)*bx) };
+            ggml_q3k_bench_expand(x, nb, x8 + (size_t) r/4*nb);
+        }
+        for (int r = 0; r < 64*rows; r += 4) { // ~20-50 ms of the old kernel first: the core's clock ramps before the timed rounds
+            const int rr = r % rows;
+            const block_q3_K * x[4] = { (const block_q3_K *) (w + rr*bx), (const block_q3_K *) (w + (rr + 1)*bx),
+                                        (const block_q3_K *) (w + (rr + 2)*bx), (const block_q3_K *) (w + (rr + 3)*bx) };
+            ggml_vec_dot_q3_K_q8_K_x4_ilp(nb, out[0] + rr, x, bx, yk);
+        }
+        ggml_q3k_bench_cpu cs = { -2, -1, 0, -1, -1 };
+        const int pinned = ggml_q3k_bench_pin();
+        int nv[8] = { 0 }, c0, c1;
+        double best[5] = { 1e30, 1e30, 1e30, 1e30, 1e30 };
+        for (int round = 0; round < 3; ++round) {
+            for (int v = 0; v < 5; ++v) {
+                for (int t = 0; t < 7; ++t) {
+                    c0 = ggml_q3k_bench_see(&cs);
+                    const double t0 = ggml_q3k_bench_now();
+                    for (int pass = 0; pass < 2; ++pass) {
+                        if (v == 3) {
+                            ggml_gemv_q4_0_4x4_q8_0(K, out[3], 0, q4x4, y0, 1, rows);
+                            continue;
+                        }
+                        for (int r = 0; r < rows; r += 4) {
+                            const block_q3_K * x[4] = { (const block_q3_K *) (w + r*bx), (const block_q3_K *) (w + (r + 1)*bx),
+                                                        (const block_q3_K *) (w + (r + 2)*bx), (const block_q3_K *) (w + (r + 3)*bx) };
+                            if      (v == 0) ggml_vec_dot_q3_K_q8_K_x4_ilp(nb, out[0] + r, x, bx, yk);
+                            else if (v == 1) ggml_vec_dot_q3_K_q8_K_x4_kern(nb, out[1] + r, x, yk);
+                            else if (v == 2) ggml_q3k_bench_int8(nb, out[2] + r, x8 + (size_t) r/4*nb, yk);
+                            else             ggml_q3k_bench_scalar(nb, out[4] + r, x, yk);
+                        }
+                    }
+                    const double ns = (ggml_q3k_bench_now() - t0) / (2.0*rows);
+                    c1 = ggml_q3k_bench_see(&cs);
+                    if (ggml_q3k_bench_valid(&cs, c0, c1)) {
+                        nv[v]++;
+                        best[v] = ns < best[v] ? ns : best[v];
+                    }
+                }
+            }
+        }
+        // cold: slots of the slice rounded up to 4 KB; step = the first slot count >= 8 MB coprime with nslots (42 of 98 used)
+        const size_t slot = (bx*rows + 4095) & ~(size_t) 4095;
+        const int nslots = (int) (GGML_Q3K_SLOTS / slot);
+        int step = (int) ((((size_t) 8 << 20) + slot - 1) / slot), ct = 0;
+        for (;; step++) { // until gcd(step, nslots) == 1
+            int a = step, b = nslots;
+            while (b) { const int t = a % b; a = b; b = t; }
+            if (a == 1) break;
+        }
+        double cold[21], hot[21], touch[21];
+        if (arena) {
+            for (int i = 0; i < nslots; ++i) memcpy(arena + (size_t) i*slot, w, bx*rows); // resident: no faults in the timing
+            memset(arena + GGML_Q3K_SLOTS, K & 0xff, GGML_Q3K_STREAM);
+            for (int t = 0; t < 21; ++t) {
+                const uint8_t * s0 = arena + (size_t) ((ct++ * step) % nslots) * slot;
+                const double nc = ggml_q3k_bench_pass(&cs, &c0, &c1, s0, rows, nb, bx, 0, out[5], yk);
+                if (ggml_q3k_bench_valid(&cs, c0, c1)) cold[nv[5]++] = nc;
+                const double nh = ggml_q3k_bench_pass(&cs, &c0, &c1, s0, rows, nb, bx, 0, out[6], yk);
+                if (ggml_q3k_bench_valid(&cs, c0, c1)) hot[nv[6]++] = nh;
+                const uint8_t * s1 = arena + (size_t) ((ct++ * step) % nslots) * slot;
+                const double nt = ggml_q3k_bench_pass(&cs, &c0, &c1, s1, rows, nb, bx, 1, out[7], yk);
+                if (ggml_q3k_bench_valid(&cs, c0, c1)) touch[nv[7]++] = nt;
+            }
+        }
+        int okn = 21;
+        for (int v = 0; v < 8; ++v) okn = nv[v] < okn ? nv[v] : okn;
+        const double mc = ggml_q3k_bench_median(cold, nv[5]), mh = ggml_q3k_bench_median(hot, nv[6]), mt = ggml_q3k_bench_median(touch, nv[7]);
+        for (int v = 0; v < 5; ++v) if (!nv[v]) best[v] = -1;
+        int ex[8];
+        for (int v = 1; v < 8; ++v) ex[v] = memcmp(out[v], out[0], rows*sizeof(float)) == 0;
+        char inst[32] = ""; // the built-in falsifier (R40): fresh slices at K 512 must be >= 5 % slower than the same slice re-run
+        if (K == 512) snprintf(inst, sizeof inst, " instrument=%s", mc > 0 && mh > 0 && mc/mh >= 1.05 ? "ok" : "invalid");
+        snprintf(line, len, "cpu-bench q3k threads=1 K=%d rows=%d old=%.2f new=%.2f int8=%.2f q4x4=%.2f scalar=%.2f exact_new=%d exact_int8=%d exact_scalar=%d "
+                 "hot=%.2f cold=%.2f cold_touch=%.2f exact_hot=%d exact_cold=%d exact_cold_touch=%d%s cpu=%d-%d migr=%d cpu_ok=%d/21 pinned=%d mhz=%d/%d",
+                 K, rows, best[0], best[1], best[2], best[3], best[4], ex[1], ex[2], ex[4], mh, mc, mt, ex[6], ex[5], ex[7], inst,
+                 cs.first, cs.last, cs.migr, okn, pinned, cs.mhz_min, cs.mhz_max);
+    }
+    free(w); free(x8); free(f); free(q40); free(q4x4); free(yk); free(y0);
+    for (int v = 0; v < 8; ++v) free(out[v]);
+    return ok;
+}
+#endif
+
+// Writes the two "cpu-bench q3k" lines (K 1,536 x 512 rows, K 512 x 1,536 rows) to stderr; 1 thread (the caller's). r13b: the
+// caller's affinity is saved, the thread re-pinned to cpu 4-6 before each shape and its mask restored after; one arena.
+void ggml_cpu_q3k_bench(void) {
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__linux__)
+    cpu_set_t saved;
+    const int had = sched_getaffinity(0, sizeof saved, &saved) == 0;
+#endif
+    char line[768];
+    uint8_t * arena = NULL;
+#if !defined(_WIN32)
+    const size_t alen = GGML_Q3K_SLOTS + GGML_Q3K_STREAM;
+    void * m = mmap(NULL, alen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    arena = m == MAP_FAILED ? NULL : (uint8_t *) m;
+#if defined(__linux__)
+    if (arena) madvise(arena, alen, MADV_NOHUGEPAGE);
+#endif
+#endif
+    if (ggml_q3k_bench_shape(1536, 512, arena, line, sizeof line)) fprintf(stderr, "%s\n", line);
+    if (ggml_q3k_bench_shape(512, 1536, arena, line, sizeof line)) fprintf(stderr, "%s\n", line);
+#if !defined(_WIN32)
+    if (arena) munmap(arena, alen);
+#endif
+#if defined(__linux__)
+    if (had) sched_setaffinity(0, sizeof saved, &saved);
+#endif
+#else
+    fprintf(stderr, "cpu-bench q3k unsupported (needs arm64 dotprod)\n");
+#endif
+    fflush(stderr);
 }
 
 #ifdef __ARM_FEATURE_SVE

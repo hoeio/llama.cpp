@@ -53,6 +53,17 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+// Vollie: four consecutive Q3_K rows (stride bx bytes) against one Q8_K row; s[0..3]. NEON only.
+void ggml_vec_dot_q3_K_q8_K_x4(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy);
+void ggml_cpu_q3k_bench(void); // Vollie: GGML_CPU_BENCH (arch/arm/quants.c)
+// Vollie: GGML_MMID_TOUCH (r13) and its cpu-bench twin: one volatile demand load (not prfm) of the first byte of each
+// 4-KB page that [p, p + n) spans, so the page walks and first-line fills start together. Reads only, results unchanged.
+// ponytail: 4-KB pages assumed (Android arm64); on 16-KB-page hosts it touches 4x more often than needed, still exact
+static inline void ggml_cpu_page_touch(const void * p, size_t n) {
+    for (uintptr_t a = (uintptr_t) p & ~(uintptr_t) 4095, e = (uintptr_t) p + n; a < e; a += 4096) {
+        (void) *(const volatile uint8_t *) a;
+    }
+}
 void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

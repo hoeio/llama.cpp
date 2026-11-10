@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 #include <arm_neon.h>
+#include "../vollie-release.h"
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -1699,6 +1700,7 @@ static void ggml_backend_cpu_kleidiai_buffer_set_tensor(ggml_backend_buffer_t bu
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
+    ggml_cpu_release_source(data, size); // Vollie: GGML_REPACK_RELEASE
     GGML_UNUSED(buffer);
 }
 

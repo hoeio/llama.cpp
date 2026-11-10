@@ -9,6 +9,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <vector>
 #include <cfloat>
 #include <cmath>
 
@@ -9950,6 +9951,60 @@ static void ggml_compute_forward_ssm_conv_f32(
     const int ir1 = MIN(ir0 + dr, nr);
     const int ir  = ir1 - ir0;
 
+    // Vollie: GGML_CONV_RING (ggml-cpu.c ggml_cpu_conv_apply; one token, one sequence): src0's CONCAT was not
+    // run; read the old state (its src[0]) and x (its src[1]) in place, same sum, and write the shifted state
+    // into the conv cache slot the skipped CPY would have written. Thread 0 alone, rows ascending: dst may
+    // start at or before the old state (ggml-cpu.c checks), so a row's inputs are read before its output is written.
+    float * conv_cache;
+    memcpy(&conv_cache, dst->op_params, sizeof(conv_cache));
+    if (conv_cache) {
+        if (ith != 0) {
+            return;
+        }
+        const ggml_tensor * st = src0->src[0]; // {d_conv - 1, d_inner}, contiguous, d_conv - 1 <= 8
+        const ggml_tensor * xt = src0->src[1]; // {1, d_inner}
+        const int ns1 = st->ne[0];
+        const float  * sp = (const float *) st->data;
+        const char   * xp = (const char *) xt->data;
+        const float  * cw = (const float *) src1->data; // rows of 4 floats on the fast path (nb[1] checked)
+        float        * out = (float *) dst->data;
+        if (ns1 == 3 && src1->nb[1] == 4*sizeof(float) && xt->nb[1] == sizeof(float)) {
+            // d_conv 4 (Mamba2): the stock loop's four steps, unrolled
+            const float * x = (const float *) xp;
+            for (int i1 = 0; i1 < nr; ++i1) {
+                const float s0 = sp[3*i1], s1 = sp[3*i1 + 1], s2 = sp[3*i1 + 2], xv = x[i1];
+                const float * c = cw + 4*i1;
+                float sumf = 0.0f;
+                sumf += s0 * c[0];
+                sumf += s1 * c[1];
+                sumf += s2 * c[2];
+                sumf += xv * c[3];
+                out[i1] = sumf;
+                conv_cache[3*i1] = s1;
+                conv_cache[3*i1 + 1] = s2;
+                conv_cache[3*i1 + 2] = xv;
+            }
+            return;
+        }
+        for (int i1 = 0; i1 < nr; ++i1) {
+            float v[9];
+            for (int i0 = 0; i0 < ns1; ++i0) {
+                v[i0] = sp[i1*ns1 + i0];
+            }
+            v[ns1] = *(const float *) (xp + i1*xt->nb[1]);
+            const float * c = (const float *) ((const char *) src1->data + i1*src1->nb[1]);
+            float sumf = 0.0f;
+            for (int i0 = 0; i0 < nc; ++i0) {
+                sumf += v[i0] * c[i0];
+            }
+            out[i1] = sumf;
+            for (int i0 = 0; i0 < ns1; ++i0) {
+                conv_cache[i1*ns1 + i0] = v[i0 + 1];
+            }
+        }
+        return;
+    }
+
     for (int i3 = 0; i3 < n_s; ++i3) {
         for (int i2 = 0; i2 < n_t; ++i2) {
             // {d_conv - 1 + n_t, d_inner, n_seqs}
@@ -10041,6 +10096,13 @@ static void ggml_compute_forward_ssm_scan_f32(
     for (int i3 = 0; i3 < ns; ++i3) {
         const float * s0 = (const float *) ((const char *) src0->data + ids[i3]*(src0->nb[3])); // {d_state, dim, nh, ns}
               float * s  = (      float *) ((      char *) dst->data  + i3*(src0->nb[3]) + s_off); // {d_state, dim, nh, ns}
+        // Vollie: GGML_SSM_INPLACE (ggml-cpu.c ggml_cpu_ssm_apply, one sequence only): the state goes
+        // straight into the recurrent cache slot the CPY after this op would have copied it to
+        float * s_cache;
+        memcpy(&s_cache, (const char *) dst->op_params + 8, sizeof(s_cache));
+        if (s_cache) {
+            s = s_cache;
+        }
 
         for (int i2 = 0; i2 < nt; ++i2) {
             const float * x  = (const float *) ((const char *) src1->data + i2*(src1->nb[2]) + i3*(src1->nb[3])); // {dim, nh, nt, ns}
@@ -12510,5 +12572,22 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+// Vollie: GGML_HEAD2 (ggml-cpu.c ggml_cpu_head2): ids of the m largest of x[0..n) into out (any order); ties go to
+// the lower id, so the set is deterministic. One call per column, on one thread.
+extern "C" void ggml_cpu_head2_topm(const float * x, int64_t n, int64_t m, int32_t * out);
+extern "C" void ggml_cpu_head2_topm(const float * x, int64_t n, int64_t m, int32_t * out) {
+    thread_local std::vector<std::pair<float, int32_t>> v;
+    v.resize(n);
+    for (int64_t i = 0; i < n; i++) {
+        v[i] = {x[i], (int32_t) i};
+    }
+    std::nth_element(v.begin(), v.begin() + m, v.end(), [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+    });
+    for (int64_t i = 0; i < m; i++) {
+        out[i] = v[i].second;
     }
 }

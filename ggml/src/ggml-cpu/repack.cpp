@@ -17,6 +17,7 @@
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
+#include "vollie-release.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -5161,6 +5162,7 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
+    ggml_cpu_release_source(data, size); // Vollie: GGML_REPACK_RELEASE
     GGML_UNUSED(buffer);
 }
 
@@ -5257,4 +5259,31 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
     };
 
     return &ggml_backend_cpu_buffer_type_repack;
+}
+
+// Vollie: GGML_HEAD2_Q=q4_0 (ggml-cpu.c ggml_cpu_head2): the screen copy in the 4-row interleave the stock Q4_0
+// weights get with extra buffers (same choice as ggml_repack_get_optimal_repack_type: i8mm -> 4x8, dotprod -> 4x4;
+// the A78 takes 4x4). Returns the interleave (8 or 4), 0 when this CPU has no 4-row Q4_0 gemv.
+// ponytail: the 8x8 (AVX2 / SVE-256) layout is not offered; those CPUs keep the plain Q4_0 screen.
+extern "C" int ggml_cpu_head2_q4_0_il(void);
+extern "C" int ggml_cpu_head2_q4_0_il(void) {
+    return ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8() ? 8 : ggml_cpu_has_neon() && ggml_cpu_has_dotprod() ? 4 : 0;
+}
+// 4 plain Q4_0 rows (src, nb blocks each, consecutive) -> nb block_q4_0x4 at dst
+extern "C" void ggml_cpu_head2_q4_0_pack4(void * dst, const void * src, int64_t nb, int il);
+extern "C" void ggml_cpu_head2_q4_0_pack4(void * dst, const void * src, int64_t nb, int il) {
+    const block_q4_0 * s = (const block_q4_0 *) src;
+    block_q4_0x4 * d = (block_q4_0x4 *) dst;
+    block_q4_0 tmp[4];
+    for (int64_t x = 0; x < nb; x++) {
+        for (int i = 0; i < 4; i++) {
+            tmp[i] = s[x + i*nb];
+        }
+        d[x] = make_block_q4_0x4(tmp, il);
+    }
+}
+// s[0..nc) = rows (packed, nc % 4 == 0) . vy (one plain Q8_0 row of n)
+extern "C" void ggml_cpu_head2_q4_0_gemv(int il, int n, float * s, const void * vx, const void * vy, int nc);
+extern "C" void ggml_cpu_head2_q4_0_gemv(int il, int n, float * s, const void * vx, const void * vy, int nc) {
+    (il == 8 ? ggml_gemv_q4_0_4x8_q8_0 : ggml_gemv_q4_0_4x4_q8_0)(n, s, 0, vx, vy, 1, nc);
 }
